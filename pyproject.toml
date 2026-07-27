@@ -6,9 +6,11 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "attn-res>=0.1.0",
+    "datasets>=3.0.0",
     "ipykernel>=6.0",
     "numpy>=2.4.6",
     "torch>=2.12.1",
+    "wandb>=0.23.0",
     # LLaDA's Hugging Face remote model code targets this API exactly.
     "transformers==4.38.2",
 ]
