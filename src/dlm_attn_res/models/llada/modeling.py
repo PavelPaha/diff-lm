@@ -1330,7 +1330,7 @@ class LLaDAModel(nn.Module):
 
                 layer_past = None if past_key_values is None else past_key_values[block_idx]
                 block_input = x
-                if attention_residual_history is not None:
+                if attention_residual_history is not None and attention_residual_scale > 0.0:
                     attention_residual_input = block.norm(
                         block.attn_res(torch.stack(attention_residual_history, dim=0))
                     )

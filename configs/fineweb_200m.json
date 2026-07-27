@@ -1,6 +1,6 @@
 {
   "run_name": "llada8b-attn-res-fineweb-200m-s42",
-  "git_commit": "430461cc7c22f4eee939d64f7eb8efc71430b7d3",
+  "git_commit": "7258722978168324ac88eda82f0fdddddada4af5",
   "seed": 42,
   "model": {
     "checkpoint": "/extra_disk_1/vasilievpavel/dlm-attn-res/huggingface/hub/models--GSAI-ML--LLaDA-8B-Base/snapshots/0f2787f2d87eac5eed8a087d5ecd24277e6255b2",
@@ -16,6 +16,8 @@
     "target_tokens": 200000000
   },
   "optimization": {
+    "train_base_model": false,
+    "activation_checkpointing": "whole_layer",
     "learning_rate": 1e-5,
     "min_lr_ratio": 0.1,
     "scheduler": "linear_warmup_cosine_decay",

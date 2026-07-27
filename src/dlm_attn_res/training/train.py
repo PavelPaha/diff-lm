@@ -15,6 +15,7 @@ from transformers import AutoTokenizer
 import wandb
 
 from dlm_attn_res.models.llada import LLaDAConfig, LLaDAModelLM
+from dlm_attn_res.models.llada.configuration import ActivationCheckpointingStrategy
 
 
 def norm(parameters):
@@ -42,10 +43,19 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(checkpoint, local_files_only=True)
     config = LLaDAConfig.from_pretrained(checkpoint, local_files_only=True)
     model = LLaDAModelLM.from_pretrained(checkpoint, config=config, torch_dtype=torch.bfloat16).to(device)
+    if opt_cfg["activation_checkpointing"]:
+        model.model.set_activation_checkpointing(
+            ActivationCheckpointingStrategy(opt_cfg["activation_checkpointing"])
+        )
+    if not opt_cfg["train_base_model"]:
+        for name, parameter in model.named_parameters():
+            parameter.requires_grad_("attn_res" in name or ".norm." in name)
     model.train()
-    model = DDP(model, device_ids=[local_rank], broadcast_buffers=False, find_unused_parameters=False)
+    # At scale=0 the AR branch is intentionally absent from the graph, so its
+    # parameters are temporarily unused.
+    model = DDP(model, device_ids=[local_rank], broadcast_buffers=False, find_unused_parameters=True)
 
-    attn_params = [p for n, p in model.named_parameters() if "attn_res" in n or ".norm." in n]
+    attn_params = [p for n, p in model.named_parameters() if p.requires_grad]
     attn_param_ids = {id(p) for p in attn_params}
     base_params = [p for _, p in model.named_parameters() if id(p) not in attn_param_ids]
     optimizer = torch.optim.AdamW([
@@ -83,11 +93,15 @@ def main():
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 logits = model(input_ids=corrupted, use_attention_residuals=cfg["attention_residuals"]["enabled"], attention_residual_scale=ar_scale).logits
                 loss = F.cross_entropy(logits[masked], ids[masked]) / opt_cfg["gradient_accumulation_steps"]
-            loss.backward(); loss_sum += loss.detach().item()
+            if loss.requires_grad:
+                loss.backward()
+            loss_sum += loss.detach().item()
             processed += ids.numel() * world
         attn_grad, base_grad = norm(attn_params), norm(base_params)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), opt_cfg["max_grad_norm"])
-        optimizer.step(); scheduler.step()
+        if any(parameter.grad is not None for parameter in attn_params):
+            torch.nn.utils.clip_grad_norm_(attn_params, opt_cfg["max_grad_norm"])
+            optimizer.step()
+        scheduler.step()
         if rank == 0 and step % cfg["logging"]["log_every_steps"] == 0:
             run.log({"train/loss": loss_sum, "train/tokens": processed, "train/lr": scheduler.get_last_lr()[0], "attn_res/scale": ar_scale, "grad_norm/attn_res": attn_grad, "grad_norm/base": base_grad, "system/max_memory_gb": torch.cuda.max_memory_allocated() / 2**30}, step=step)
     if rank == 0: run.finish()
