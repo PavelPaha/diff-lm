@@ -1,0 +1,17 @@
+include: mbpp_instruct.yaml
+task: mbpp_reasoning_v1
+doc_to_text: "Solve the following Python programming problem.\nKeep your reasoning concise and put it inside <think>...</think>. You must close </think>, then output only the final Python solution in a ```python code block.\n\nTask: {{text}}\n\nYour code must pass these tests:\n{{test_list[0]}}\n{{test_list[1]}}\n{{test_list[2]}}\n\nUse the exact function name from the tests. Do not include tests or explanations in the final code block."
+gen_prefix: null
+generation_kwargs:
+  until:
+    - "\nTest the above solution"
+    - "\nNow test the solution"
+    - "\nThe above solution"
+  do_sample: false
+filter_list:
+  - name: "reasoning-code"
+    filter:
+      - function: "custom"
+        filter_fn: !function utils.build_predictions_reasoning
+metadata:
+  version: 1.0

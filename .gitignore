@@ -1,0 +1,21 @@
+# Environments, caches and generated files
+.venv/
+.venv-*/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.ipynb_checkpoints/
+
+# Model weights, research PDFs and benchmark artefacts
+docs/
+papers/
+results/
+*.safetensors
+*.bin
+*.pt
+*.pth
+
+# Preserve the original LLaDA clone metadata locally without nesting a Git repo.
+vendor/llada_upstream/.git-upstream/

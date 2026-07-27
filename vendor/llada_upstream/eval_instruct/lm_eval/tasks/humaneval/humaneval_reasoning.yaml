@@ -1,0 +1,17 @@
+include: humaneval.yaml
+task: humaneval_reasoning
+doc_to_text: "Solve the following Python programming problem.\nKeep your reasoning concise and put it inside <think>...</think>. You must close </think>, then output only the final Python solution in a ```python code block.\n\n{{prompt}}"
+generation_kwargs:
+  until:
+    - "\nTest the above solution"
+    - "\nNow test the solution"
+    - "\nThe above solution"
+  max_gen_toks: 1024
+  do_sample: false
+filter_list:
+  - name: "create_test"
+    filter:
+      - function: "custom"
+        filter_fn: !function utils.build_predictions_reasoning
+metadata:
+  version: 1.0

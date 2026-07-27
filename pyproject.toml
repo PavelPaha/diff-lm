@@ -1,0 +1,21 @@
+[project]
+name = "dlm-attn-res"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "attn-res>=0.1.0",
+    "ipykernel>=6.0",
+    "numpy>=2.4.6",
+    "torch>=2.12.1",
+    # LLaDA's Hugging Face remote model code targets this API exactly.
+    "transformers==4.38.2",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]

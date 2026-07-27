@@ -1,0 +1,34 @@
+group: mmlu_pro_reasoning
+task:
+  - mmlu_pro_biology
+  - mmlu_pro_business
+  - mmlu_pro_chemistry
+  - mmlu_pro_computer_science
+  - mmlu_pro_economics
+  - mmlu_pro_engineering
+  - mmlu_pro_health
+  - mmlu_pro_history
+  - mmlu_pro_law
+  - mmlu_pro_math
+  - mmlu_pro_other
+  - mmlu_pro_philosophy
+  - mmlu_pro_physics
+  - mmlu_pro_psychology
+aggregate_metric_list:
+  - aggregation: mean
+    metric: exact_match
+    weight_by_size: true
+    filter_list: reasoning-extract
+filter_list:
+  - name: "reasoning-extract"
+    filter:
+      - function: "custom"
+        filter_fn: !function utils.extract_mmlu_pro_reasoning_answer
+num_fewshot: 0
+generation_kwargs:
+  until:
+    - "Question:"
+  do_sample: false
+  temperature: 0.0
+metadata:
+  version: 1.0

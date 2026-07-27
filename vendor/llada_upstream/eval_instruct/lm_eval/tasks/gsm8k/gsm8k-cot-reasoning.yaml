@@ -1,0 +1,11 @@
+include: gsm8k-cot.yaml
+task: gsm8k_cot_reasoning
+doc_to_text: "Q: {{question}}\n\nA: Solve the problem step by step. At the end, write the final answer on a separate line in this exact format:\n#### <number>\n"
+filter_list:
+  - name: reasoning-final-answer
+    filter:
+      - function: custom
+        filter_fn: !function utils.extract_gsm8k_reasoning_answer
+metadata:
+  version: 1.0
+num_fewshot: 0
