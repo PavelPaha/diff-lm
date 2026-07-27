@@ -42,6 +42,8 @@ from .configuration import (
     ActivationCheckpointingStrategy,
 )
 
+from attn_res import AttnResOperator, RMSNorm
+
 if sys.version_info.minor > 8:
     from collections.abc import MutableMapping
 elif sys.version_info.minor == 8:
@@ -549,6 +551,10 @@ class LLaDABlock(nn.Module):
             )
             self.q_norm = LayerNormBase.build(config, elementwise_affine=config.attention_layer_norm_with_affine)
 
+        # attention residuals
+        self.attn_res = AttnResOperator(config.d_model)
+        self.norm = RMSNorm(config.d_model)
+
         # Activation function.
         self.act = Activation.build(config)
         assert (self.act.output_multiplier * self.hidden_size) % 1 == 0
@@ -975,12 +981,17 @@ class LLaDABlockGroup(nn.ModuleList):
 
     def forward(
         self,
-        x: torch.Tensor,
+        hidden_states: torch.Tensor,
         attention_bias: Optional[torch.FloatTensor] = None,
         layers_past: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
         use_cache: bool = False,
+        use_attention_residuals: bool = False,
     ) -> Tuple[torch.Tensor, Optional[List[Tuple[torch.Tensor, torch.Tensor]]]]:
         attn_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = [] if use_cache else None
+        
+        if use_attention_residuals:
+            hidden_states = hidden_states[None, ...]
+        
         for block_idx, block in enumerate(self):
             layer_past = None if layers_past is None else layers_past[block_idx]
             block_idx += self.layer_offset
@@ -1000,16 +1011,26 @@ class LLaDABlockGroup(nn.ModuleList):
                 )
             ):
                 # shape: (batch_size, seq_len, d_model)
-                x, cache = self._activation_checkpoint_fn(  # type: ignore
-                    block, x, attention_bias=attention_bias, layer_past=layer_past, use_cache=use_cache
+                out, cache = self._activation_checkpoint_fn(  # type: ignore
+                    block, hidden_states, attention_bias=attention_bias, layer_past=layer_past, use_cache=use_cache
                 )
+                if use_attention_residuals:
+                    hidden_states = torch.cat([hidden_states, out[None, ...]], dim=0)
+                else:
+                    hidden_states = out
             else:
                 # shape: (batch_size, seq_len, d_model)
-                x, cache = block(x, attention_bias=attention_bias, layer_past=layer_past, use_cache=use_cache)
+                out, cache = block(hidden_states, attention_bias=attention_bias, layer_past=layer_past, use_cache=use_cache)
+                
+                if use_attention_residuals:
+                    hidden_states = torch.cat([hidden_states, out[None, ...]], dim=0)
+                else:
+                    hidden_states = out
+                
             if attn_key_values is not None:
                 assert cache is not None
                 attn_key_values.append(cache)
-        return x, attn_key_values
+        return hidden_states, attn_key_values
 
     def reset_parameters(self):
         for block in self:
@@ -1181,6 +1202,8 @@ class LLaDAModel(nn.Module):
         use_cache: bool = False,
         last_logits_only: bool = False,
         output_hidden_states: Optional[bool] = None,
+        use_attention_residuals: bool = False,
+        attention_residual_scale: float = 0.0,
     ) -> LLaDAOutput:
         """
         :param input_ids: A tensor of shape `(batch_size, seq_len)`.
@@ -1298,12 +1321,20 @@ class LLaDAModel(nn.Module):
 
         # Apply blocks one-by-one.
         if self.config.block_group_size == 1:
+            attention_residual_scale = float(max(0.0, min(1.0, attention_residual_scale)))
+            attention_residual_history = [x] if use_attention_residuals else None
             for block_idx, block in enumerate(self.transformer.blocks):
                 if output_hidden_states:
                     # add hidden states
                     all_hidden_states.append(x)
 
                 layer_past = None if past_key_values is None else past_key_values[block_idx]
+                block_input = x
+                if attention_residual_history is not None:
+                    attention_residual_input = block.norm(
+                        block.attn_res(torch.stack(attention_residual_history, dim=0))
+                    )
+                    block_input = x + attention_residual_scale * (attention_residual_input - x)
                 if (
                     (self.activation_checkpointing_strategy == ActivationCheckpointingStrategy.whole_layer)
                     or (
@@ -1321,11 +1352,18 @@ class LLaDAModel(nn.Module):
                 ):
                     # shape: (batch_size, seq_len, d_model)
                     x, cache = self._activation_checkpoint_fn(
-                        block, x, attention_bias=attention_bias, layer_past=layer_past, use_cache=use_cache
+                        block, block_input, attention_bias=attention_bias, layer_past=layer_past, use_cache=use_cache
                     )
                 else:
                     # shape: (batch_size, seq_len, d_model)
-                    x, cache = block(x, attention_bias=attention_bias, layer_past=layer_past, use_cache=use_cache)
+                    x, cache = block(
+                        block_input,
+                        attention_bias=attention_bias,
+                        layer_past=layer_past, 
+                        use_cache=use_cache,
+                    )
+                if attention_residual_history is not None:
+                    attention_residual_history.append(x)
                 if attn_key_values is not None:
                     assert cache is not None
                     attn_key_values.append(cache)
@@ -1418,6 +1456,8 @@ class LLaDAModelLM(PreTrainedModel):
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
         cache_position: Optional[Cache] = None,  # This is a hack mitigation of an issue in transformers `4.39.x`
+        use_attention_residuals: bool = False,
+        attention_residual_scale: float = 0.0,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         if use_cache is None:
             use_cache = self.config.use_cache
@@ -1436,6 +1476,8 @@ class LLaDAModelLM(PreTrainedModel):
             past_key_values=past_key_values,
             use_cache=use_cache,
             output_hidden_states=output_hidden_states,
+            use_attention_residuals=use_attention_residuals,
+            attention_residual_scale=attention_residual_scale,
         )
 
         logits = outputs.logits
