@@ -13,6 +13,7 @@ from datasets import load_dataset
 from torch.nn.parallel import DistributedDataParallel as DDP
 from transformers import AutoTokenizer
 import wandb
+from tqdm.auto import tqdm
 
 from dlm_attn_res.models.llada import LLaDAConfig, LLaDAModelLM
 from dlm_attn_res.models.llada.configuration import ActivationCheckpointingStrategy
@@ -71,12 +72,26 @@ def main():
         return opt_cfg["min_lr_ratio"] + (1 - opt_cfg["min_lr_ratio"]) * .5 * (1 + math.cos(math.pi * progress))
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, factor)
 
-    dataset = load_dataset(data_cfg["dataset"], data_cfg["subset"], split=data_cfg["split"], streaming=True).shard(world, rank)
+    dataset = load_dataset(
+        data_cfg["dataset"],
+        name=data_cfg.get("subset"),
+        split=data_cfg["split"],
+        streaming=True,
+    ).shard(world, rank)
     iterator = iter(dataset)
     if rank == 0:
         run = wandb.init(entity=cfg["logging"]["wandb_entity"], project=cfg["logging"]["wandb_project"], name=cfg["run_name"], config=cfg, settings=wandb.Settings(base_url=cfg["logging"]["wandb_base_url"]))
+        # Keep the exact input file in the run, not only its parsed key/value
+        # representation shown in the W&B Config panel.
+        run.save(str(args.config), base_path=str(args.config.parent), policy="now")
     context, mask_id, processed = model_cfg["context_length"], model_cfg["mask_token_id"], 0
-    for step in range(total_steps):
+    progress_bar = tqdm(
+        range(total_steps),
+        disable=rank != 0,
+        dynamic_ncols=True,
+        desc="FineWeb fine-tune",
+    )
+    for step in progress_bar:
         optimizer.zero_grad(set_to_none=True)
         loss_sum = 0.0
         for micro in range(opt_cfg["gradient_accumulation_steps"]):
@@ -103,7 +118,11 @@ def main():
             optimizer.step()
         scheduler.step()
         if rank == 0 and step % cfg["logging"]["log_every_steps"] == 0:
-            run.log({"train/loss": loss_sum, "train/tokens": processed, "train/lr": scheduler.get_last_lr()[0], "attn_res/scale": ar_scale, "grad_norm/attn_res": attn_grad, "grad_norm/base": base_grad, "system/max_memory_gb": torch.cuda.max_memory_allocated() / 2**30}, step=step)
+            metrics = {"train/loss": loss_sum, "train/tokens": processed, "train/lr": scheduler.get_last_lr()[0], "attn_res/scale": ar_scale, "grad_norm/attn_res": attn_grad, "grad_norm/base": base_grad, "system/max_memory_gb": torch.cuda.max_memory_allocated() / 2**30}
+            run.log(metrics, step=step)
+            progress_bar.set_postfix(loss=f"{loss_sum:.4f}", lr=f"{metrics['train/lr']:.2e}", ar=f"{ar_scale:.3f}")
+            if step % 10 == 0:
+                tqdm.write(f"step={step}/{total_steps} tokens={processed:,} loss={loss_sum:.4f} lr={metrics['train/lr']:.3e} ar_scale={ar_scale:.4f}")
     if rank == 0: run.finish()
     dist.destroy_process_group()
 
