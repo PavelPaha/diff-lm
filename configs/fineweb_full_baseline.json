@@ -1,6 +1,6 @@
 {
   "run_name": "llada8b-fineweb-full-baseline-sft-schedule",
-  "git_commit": "e2b2f6ebad0d61f54e0db18e7b664e58431b642f",
+  "git_commit": "923ce2bdf3f1154060039545aaea1a9cc7dee42b",
   "seed": 42,
   "model": {
     "checkpoint": "/extra_disk_1/vasilievpavel/dlm-attn-res/huggingface/hub/models--GSAI-ML--LLaDA-8B-Base/snapshots/0f2787f2d87eac5eed8a087d5ecd24277e6255b2",
