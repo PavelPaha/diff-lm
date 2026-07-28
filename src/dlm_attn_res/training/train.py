@@ -319,6 +319,7 @@ def main():
                     attention_mask=attention_mask,
                     use_attention_residuals=cfg["attention_residuals"]["enabled"],
                     attention_residual_scale=ar_scale,
+                    attention_residual_match_input_rms=cfg["attention_residuals"].get("match_input_rms", False),
                     capture_attention_residual_maps=capture_attention_maps,
                     capture_attention_residual_diagnostics=capture_attention_residual_diagnostics,
                     capture_layer_diagnostics=capture_layer_diagnostics,
