@@ -35,15 +35,10 @@ def attention_residual_layer_metrics(model, include_gradients):
     for layer_idx, block in enumerate(model.model.transformer.blocks):
         prefix = f"attn_res/layer_{layer_idx:02d}"
         pseudo_query = block.attn_res.pseudo_query
-        output_norm_weight = block.norm.weight
         metrics[f"{prefix}/pseudo_query_norm"] = parameter_norm(pseudo_query)
-        metrics[f"{prefix}/output_rmsnorm_weight_norm"] = parameter_norm(output_norm_weight)
         if include_gradients:
             metrics[f"{prefix}/pseudo_query_grad_norm"] = (
                 parameter_norm(pseudo_query.grad) if pseudo_query.grad is not None else 0.0
-            )
-            metrics[f"{prefix}/output_rmsnorm_weight_grad_norm"] = (
-                parameter_norm(output_norm_weight.grad) if output_norm_weight.grad is not None else 0.0
             )
     return metrics
 
@@ -138,10 +133,7 @@ def main():
             ActivationCheckpointingStrategy(opt_cfg["activation_checkpointing"])
         )
     def is_attention_residual_parameter(name):
-        # `norm` is the RMSNorm inserted immediately after the AR operator;
-        # original LLaDA norms are named `attn_norm` / `ff_norm` and do not
-        # match this dotted component.
-        return "attn_res" in name or ".norm." in name
+        return "attn_res" in name
 
     if not opt_cfg["train_base_model"]:
         for name, parameter in model.named_parameters():

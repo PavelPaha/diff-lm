@@ -42,7 +42,7 @@ from .configuration import (
     ActivationCheckpointingStrategy,
 )
 
-from attn_res import AttnResOperator, RMSNorm
+from attn_res import AttnResOperator
 
 if sys.version_info.minor > 8:
     from collections.abc import MutableMapping
@@ -551,9 +551,10 @@ class LLaDABlock(nn.Module):
             )
             self.q_norm = LayerNormBase.build(config, elementwise_affine=config.attention_layer_norm_with_affine)
 
-        # attention residuals
+        # The operator normalizes keys for routing, but routed values retain
+        # their residual-stream scale. A post-AttnRes RMSNorm would force that
+        # scale to one and destabilize a pretrained model.
         self.attn_res = AttnResOperator(config.d_model)
-        self.norm = RMSNorm(config.d_model)
 
         # Activation function.
         self.act = Activation.build(config)
@@ -1341,7 +1342,7 @@ class LLaDAModel(nn.Module):
                 block_input = x
                 if attention_residual_history is not None and attention_residual_scale > 0.0:
                     residual_sources = torch.stack(attention_residual_history, dim=0)
-                    attention_residual_input = block.norm(block.attn_res(residual_sources))
+                    attention_residual_input = block.attn_res(residual_sources)
                     if capture_attention_residual_maps or capture_attention_residual_diagnostics:
                         # Match AttnResOperator.forward, but do it under
                         # no_grad and reduce immediately so logging never
