@@ -41,7 +41,7 @@
   },
   "attention_residuals": {
     "enabled": true,
-    "warmup_steps": 25,
+    "warmup_steps": 300,
     "scale_schedule": "linear_0_to_1"
   },
   "distributed": {
