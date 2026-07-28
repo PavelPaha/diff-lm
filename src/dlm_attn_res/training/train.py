@@ -26,17 +26,42 @@ def norm(parameters):
 
 
 def attention_residual_image(source_maps, num_layers):
-    """Turn depth-wise AR weights into one triangular W&B heatmap.
+    """Render depth-wise AR routing as an explicit RGB heatmap.
 
     Row `i` is the residual routing used before transformer block `i`; column
-    `j` is the source representation from depth `j`.  Each value is averaged
-    over the current microbatch and token positions.
+    `j` is the source representation from depth `j`. Colors show the weight
+    *relative to uniform routing* in that row: grey = uniform, red = preferred
+    source, blue = suppressed source. This makes small weights visible and
+    avoids W&B/Pillow treating NaNs outside the triangle as black pixels.
     """
-    image = np.full((num_layers, num_layers), np.nan, dtype=np.float32)
+    routing = np.zeros((num_layers, num_layers), dtype=np.float32)
+    valid = np.zeros((num_layers, num_layers), dtype=bool)
     for block_idx, weights in enumerate(source_maps):
-        image[block_idx, : weights.numel()] = weights.numpy()
-    # W&B normalizes the finite values and renders this as a heatmap.
-    return wandb.Image(image, caption="Attention Residuals: target block (row) × source depth (column)")
+        count = weights.numel()
+        # `weights * count - 1` is zero for an exactly uniform distribution.
+        routing[block_idx, :count] = weights.numpy() * count - 1.0
+        valid[block_idx, :count] = True
+
+    max_deviation = max(float(np.abs(routing[valid]).max(initial=0.0)), 1e-6)
+    normalized = np.clip(routing / max_deviation, -1.0, 1.0)
+    rgb = np.full((num_layers, num_layers, 3), 42, dtype=np.uint8)
+    # A compact diverging palette: blue -> neutral grey -> red.
+    positive = normalized >= 0
+    rgb[..., 0][valid] = 180
+    rgb[..., 1][valid] = 180
+    rgb[..., 2][valid] = 180
+    rgb[..., 0][valid & positive] = 180 + (75 * normalized[valid & positive]).astype(np.uint8)
+    rgb[..., 1][valid & positive] = 180 - (120 * normalized[valid & positive]).astype(np.uint8)
+    rgb[..., 2][valid & positive] = 180 - (120 * normalized[valid & positive]).astype(np.uint8)
+    negative = valid & ~positive
+    magnitude = -normalized[negative]
+    rgb[..., 0][negative] = 180 - (120 * magnitude).astype(np.uint8)
+    rgb[..., 1][negative] = 180 - (120 * magnitude).astype(np.uint8)
+    rgb[..., 2][negative] = 180 + (75 * magnitude).astype(np.uint8)
+    return wandb.Image(
+        rgb,
+        caption="Attention Residual routing: row=target block, column=source depth; grey=uniform, red=preferred, blue=suppressed",
+    )
 
 
 def main():
@@ -124,7 +149,13 @@ def main():
         optimizer = torch.optim.AdamW(parameter_groups, **optimizer_kwargs)
     tokens_per_step = world * opt_cfg["micro_batch_size"] * model_cfg["context_length"] * opt_cfg["gradient_accumulation_steps"]
     total_steps = math.ceil(data_cfg["target_tokens"] / tokens_per_step)
-    warmup_steps = max(1, round(total_steps * opt_cfg["warmup_ratio"]))
+    warmup_steps = opt_cfg.get("warmup_steps")
+    if warmup_steps is None:
+        warmup_steps = max(1, round(total_steps * opt_cfg["warmup_ratio"]))
+    else:
+        warmup_steps = int(warmup_steps)
+        if not 0 < warmup_steps < total_steps:
+            raise ValueError(f"warmup_steps must be in [1, {total_steps - 1}], got {warmup_steps}")
     def factor(step):
         if step < warmup_steps: return (step + 1) / warmup_steps
         progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
