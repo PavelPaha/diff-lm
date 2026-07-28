@@ -43,6 +43,14 @@ def attention_residual_layer_metrics(model, include_gradients):
     return metrics
 
 
+def transformer_layer_gradient_metrics(model):
+    """Per-block gradient norms under names shared by baseline and AttnRes runs."""
+    return {
+        f"transformer/layer_{layer_idx:02d}/parameter_grad_norm": norm(block.parameters())
+        for layer_idx, block in enumerate(model.model.transformer.blocks)
+    }
+
+
 def attention_residual_image(source_maps, num_layers):
     """Render depth-wise AR routing as an explicit RGB heatmap.
 
@@ -299,6 +307,12 @@ def main():
                 and step % diagnostics_every == 0
                 and micro == opt_cfg["gradient_accumulation_steps"] - 1
             )
+            capture_layer_diagnostics = (
+                rank == 0
+                and diagnostics_enabled
+                and step % diagnostics_every == 0
+                and micro == opt_cfg["gradient_accumulation_steps"] - 1
+            )
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 logits = model(
                     input_ids=corrupted,
@@ -307,6 +321,7 @@ def main():
                     attention_residual_scale=ar_scale,
                     capture_attention_residual_maps=capture_attention_maps,
                     capture_attention_residual_diagnostics=capture_attention_residual_diagnostics,
+                    capture_layer_diagnostics=capture_layer_diagnostics,
                 ).logits
                 token_loss = F.cross_entropy(logits[masked], ids[masked], reduction="none")
                 token_loss = token_loss / p_mask[:, None].expand_as(ids)[masked]
@@ -323,6 +338,9 @@ def main():
         layer_gradients_pre_clip = (
             attention_residual_layer_metrics(model.module, include_gradients=True)
             if capture_attention_residual_diagnostics else {}
+        )
+        transformer_gradients_pre_clip = (
+            transformer_layer_gradient_metrics(model.module) if capture_layer_diagnostics else {}
         )
         trainable_params = base_params + attn_params
         attn_grad_post_clip, base_grad_post_clip = attn_grad_pre_clip, base_grad_pre_clip
@@ -371,6 +389,12 @@ def main():
                 for name, value in layer_gradients_post_clip.items():
                     if name.endswith("_grad_norm"):
                         metrics[f"{name}_post_clip"] = value
+            if capture_layer_diagnostics:
+                for layer_idx, values in enumerate(model.module.model.last_layer_diagnostics):
+                    metrics.update({f"transformer/layer_{layer_idx:02d}/{name}": value for name, value in values.items()})
+                metrics.update({f"{name}_pre_clip": value for name, value in transformer_gradients_pre_clip.items()})
+                transformer_gradients_post_clip = transformer_layer_gradient_metrics(model.module)
+                metrics.update({f"{name}_post_clip": value for name, value in transformer_gradients_post_clip.items()})
             run.log(metrics, step=step)
             progress_bar.set_postfix(loss=f"{loss_sum:.4f}", lr=f"{metrics['train/lr_base']:.2e}/{metrics['train/lr_attention_residuals']:.2e}", ar=f"{ar_scale:.3f}")
             if step % 10 == 0:

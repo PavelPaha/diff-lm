@@ -1207,6 +1207,7 @@ class LLaDAModel(nn.Module):
         attention_residual_scale: float = 0.0,
         capture_attention_residual_maps: bool = False,
         capture_attention_residual_diagnostics: bool = False,
+        capture_layer_diagnostics: bool = False,
     ) -> LLaDAOutput:
         """
         :param input_ids: A tensor of shape `(batch_size, seq_len)`.
@@ -1328,6 +1329,7 @@ class LLaDAModel(nn.Module):
         # the full [sources, batch, tokens] tensor would be prohibitively large.
         self.last_attention_residual_maps = []
         self.last_attention_residual_diagnostics = []
+        self.last_layer_diagnostics = []
 
         # Apply blocks one-by-one.
         if self.config.block_group_size == 1:
@@ -1338,8 +1340,9 @@ class LLaDAModel(nn.Module):
                     # add hidden states
                     all_hidden_states.append(x)
 
+                layer_input = x
                 layer_past = None if past_key_values is None else past_key_values[block_idx]
-                block_input = x
+                block_input = layer_input
                 if attention_residual_history is not None and attention_residual_scale > 0.0:
                     residual_sources = torch.stack(attention_residual_history, dim=0)
                     attention_residual_input = block.attn_res(residual_sources)
@@ -1382,7 +1385,7 @@ class LLaDAModel(nn.Module):
                                         and torch.isfinite(source_scores).all()
                                     ),
                                 })
-                    block_input = x + attention_residual_scale * (attention_residual_input - x)
+                    block_input = layer_input + attention_residual_scale * (attention_residual_input - layer_input)
                 if (
                     (self.activation_checkpointing_strategy == ActivationCheckpointingStrategy.whole_layer)
                     or (
@@ -1410,6 +1413,20 @@ class LLaDAModel(nn.Module):
                         layer_past=layer_past, 
                         use_cache=use_cache,
                     )
+                if capture_layer_diagnostics:
+                    with torch.no_grad():
+                        input_value = layer_input.detach()
+                        block_input_value = block_input.detach()
+                        delta = block_input_value - input_value
+                        self.last_layer_diagnostics.append({
+                            "residual_input_rms": input_value.float().square().mean().sqrt().item(),
+                            "block_input_rms": block_input_value.float().square().mean().sqrt().item(),
+                            "block_input_delta_rms": delta.float().square().mean().sqrt().item(),
+                            "block_output_rms": x.detach().float().square().mean().sqrt().item(),
+                            "finite": float(
+                                torch.isfinite(block_input_value).all() and torch.isfinite(x).all()
+                            ),
+                        })
                 if attention_residual_history is not None:
                     attention_residual_history.append(x)
                 if attn_key_values is not None:
@@ -1508,6 +1525,7 @@ class LLaDAModelLM(PreTrainedModel):
         attention_residual_scale: float = 0.0,
         capture_attention_residual_maps: bool = False,
         capture_attention_residual_diagnostics: bool = False,
+        capture_layer_diagnostics: bool = False,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         if use_cache is None:
             use_cache = self.config.use_cache
@@ -1530,6 +1548,7 @@ class LLaDAModelLM(PreTrainedModel):
             attention_residual_scale=attention_residual_scale,
             capture_attention_residual_maps=capture_attention_residual_maps,
             capture_attention_residual_diagnostics=capture_attention_residual_diagnostics,
+            capture_layer_diagnostics=capture_layer_diagnostics,
         )
 
         logits = outputs.logits
