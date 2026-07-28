@@ -1,6 +1,6 @@
 {
   "run_name": "llada8b-fineweb-full-baseline",
-  "git_commit": null,
+  "git_commit": "ee85f829f2f5abf8d4b9db40f099253971e286c2",
   "seed": 42,
   "model": {
     "checkpoint": "/extra_disk_1/vasilievpavel/dlm-attn-res/huggingface/hub/models--GSAI-ML--LLaDA-8B-Base/snapshots/0f2787f2d87eac5eed8a087d5ecd24277e6255b2",
