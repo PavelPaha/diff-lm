@@ -1204,6 +1204,7 @@ class LLaDAModel(nn.Module):
         output_hidden_states: Optional[bool] = None,
         use_attention_residuals: bool = False,
         attention_residual_scale: float = 0.0,
+        capture_attention_residual_maps: bool = False,
     ) -> LLaDAOutput:
         """
         :param input_ids: A tensor of shape `(batch_size, seq_len)`.
@@ -1319,6 +1320,12 @@ class LLaDAModel(nn.Module):
         # decoder layers
         all_hidden_states = []
 
+        # Attention over residual sources is a depth-wise distribution, not the
+        # usual token-to-token attention.  When requested by the trainer we
+        # retain only its batch/token average for each target block.  Keeping
+        # the full [sources, batch, tokens] tensor would be prohibitively large.
+        self.last_attention_residual_maps = []
+
         # Apply blocks one-by-one.
         if self.config.block_group_size == 1:
             attention_residual_scale = float(max(0.0, min(1.0, attention_residual_scale)))
@@ -1331,9 +1338,21 @@ class LLaDAModel(nn.Module):
                 layer_past = None if past_key_values is None else past_key_values[block_idx]
                 block_input = x
                 if attention_residual_history is not None and attention_residual_scale > 0.0:
-                    attention_residual_input = block.norm(
-                        block.attn_res(torch.stack(attention_residual_history, dim=0))
-                    )
+                    residual_sources = torch.stack(attention_residual_history, dim=0)
+                    attention_residual_input = block.norm(block.attn_res(residual_sources))
+                    if capture_attention_residual_maps:
+                        # Match AttnResOperator.forward, but do it under
+                        # no_grad and reduce immediately so logging never
+                        # retains the training graph or a full token-level map.
+                        with torch.no_grad():
+                            source_keys = block.attn_res.key_norm(residual_sources.detach())
+                            source_scores = torch.einsum(
+                                "d, n b t d -> n b t", block.attn_res.pseudo_query.detach(), source_keys
+                            )
+                            source_weights = torch.softmax(source_scores.float(), dim=0)
+                            self.last_attention_residual_maps.append(
+                                source_weights.mean(dim=(1, 2)).cpu()
+                            )
                     block_input = x + attention_residual_scale * (attention_residual_input - x)
                 if (
                     (self.activation_checkpointing_strategy == ActivationCheckpointingStrategy.whole_layer)
@@ -1458,6 +1477,7 @@ class LLaDAModelLM(PreTrainedModel):
         cache_position: Optional[Cache] = None,  # This is a hack mitigation of an issue in transformers `4.39.x`
         use_attention_residuals: bool = False,
         attention_residual_scale: float = 0.0,
+        capture_attention_residual_maps: bool = False,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         if use_cache is None:
             use_cache = self.config.use_cache
@@ -1478,6 +1498,7 @@ class LLaDAModelLM(PreTrainedModel):
             output_hidden_states=output_hidden_states,
             use_attention_residuals=use_attention_residuals,
             attention_residual_scale=attention_residual_scale,
+            capture_attention_residual_maps=capture_attention_residual_maps,
         )
 
         logits = outputs.logits

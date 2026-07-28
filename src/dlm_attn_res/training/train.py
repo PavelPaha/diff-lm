@@ -24,6 +24,20 @@ def norm(parameters):
     return torch.stack(values).sum().sqrt().item() if values else 0.0
 
 
+def attention_residual_image(source_maps, num_layers):
+    """Turn depth-wise AR weights into one triangular W&B heatmap.
+
+    Row `i` is the residual routing used before transformer block `i`; column
+    `j` is the source representation from depth `j`.  Each value is averaged
+    over the current microbatch and token positions.
+    """
+    image = np.full((num_layers, num_layers), np.nan, dtype=np.float32)
+    for block_idx, weights in enumerate(source_maps):
+        image[block_idx, : weights.numel()] = weights.numpy()
+    # W&B normalizes the finite values and renders this as a heatmap.
+    return wandb.Image(image, caption="Attention Residuals: target block (row) × source depth (column)")
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=Path, required=True)
@@ -48,21 +62,48 @@ def main():
         model.model.set_activation_checkpointing(
             ActivationCheckpointingStrategy(opt_cfg["activation_checkpointing"])
         )
+    def is_attention_residual_parameter(name):
+        # `norm` is the RMSNorm inserted immediately after the AR operator;
+        # original LLaDA norms are named `attn_norm` / `ff_norm` and do not
+        # match this dotted component.
+        return "attn_res" in name or ".norm." in name
+
     if not opt_cfg["train_base_model"]:
         for name, parameter in model.named_parameters():
-            parameter.requires_grad_("attn_res" in name or ".norm." in name)
+            parameter.requires_grad_(is_attention_residual_parameter(name))
     model.train()
     # At scale=0 the AR branch is intentionally absent from the graph, so its
     # parameters are temporarily unused.
     model = DDP(model, device_ids=[local_rank], broadcast_buffers=False, find_unused_parameters=True)
 
-    attn_params = [p for n, p in model.named_parameters() if p.requires_grad]
-    attn_param_ids = {id(p) for p in attn_params}
-    base_params = [p for _, p in model.named_parameters() if id(p) not in attn_param_ids]
-    optimizer = torch.optim.AdamW([
-        {"params": base_params, "weight_decay": opt_cfg["weight_decay"]},
-        {"params": attn_params, "weight_decay": opt_cfg["weight_decay"]},
-    ], lr=opt_cfg["learning_rate"], betas=(opt_cfg["adam_beta1"], opt_cfg["adam_beta2"]), eps=opt_cfg["adam_eps"])
+    attn_params = [
+        parameter for name, parameter in model.named_parameters()
+        if parameter.requires_grad and is_attention_residual_parameter(name)
+    ]
+    base_params = [
+        parameter for name, parameter in model.named_parameters()
+        if parameter.requires_grad and not is_attention_residual_parameter(name)
+    ]
+    parameter_groups = []
+    if base_params:
+        parameter_groups.append({
+            "params": base_params,
+            "lr": opt_cfg["base_learning_rate"],
+            "weight_decay": opt_cfg["weight_decay"],
+            "name": "base",
+        })
+    if attn_params:
+        parameter_groups.append({
+            "params": attn_params,
+            "lr": opt_cfg["attention_residual_learning_rate"],
+            "weight_decay": opt_cfg["weight_decay"],
+            "name": "attention_residuals",
+        })
+    optimizer = torch.optim.AdamW(
+        parameter_groups,
+        betas=(opt_cfg["adam_beta1"], opt_cfg["adam_beta2"]),
+        eps=opt_cfg["adam_eps"],
+    )
     tokens_per_step = world * opt_cfg["micro_batch_size"] * model_cfg["context_length"] * opt_cfg["gradient_accumulation_steps"]
     total_steps = math.ceil(data_cfg["target_tokens"] / tokens_per_step)
     warmup_steps = max(1, round(total_steps * opt_cfg["warmup_ratio"]))
@@ -85,6 +126,7 @@ def main():
         # representation shown in the W&B Config panel.
         run.save(str(args.config), base_path=str(args.config.parent), policy="now")
     context, mask_id, processed = model_cfg["context_length"], model_cfg["mask_token_id"], 0
+    attention_map_every = cfg["logging"].get("attention_maps_every_steps", 20)
     progress_bar = tqdm(
         range(total_steps),
         disable=rank != 0,
@@ -105,24 +147,55 @@ def main():
             if not masked.any(): masked[0, -1] = True
             corrupted = ids.masked_fill(masked, mask_id)
             ar_scale = min(step / cfg["attention_residuals"]["warmup_steps"], 1.0)
+            capture_attention_maps = (
+                rank == 0
+                and cfg["attention_residuals"]["enabled"]
+                and ar_scale > 0.0
+                and step % attention_map_every == 0
+                and micro == opt_cfg["gradient_accumulation_steps"] - 1
+            )
             with torch.autocast("cuda", dtype=torch.bfloat16):
-                logits = model(input_ids=corrupted, use_attention_residuals=cfg["attention_residuals"]["enabled"], attention_residual_scale=ar_scale).logits
+                logits = model(
+                    input_ids=corrupted,
+                    use_attention_residuals=cfg["attention_residuals"]["enabled"],
+                    attention_residual_scale=ar_scale,
+                    capture_attention_residual_maps=capture_attention_maps,
+                ).logits
                 loss = F.cross_entropy(logits[masked], ids[masked]) / opt_cfg["gradient_accumulation_steps"]
             if loss.requires_grad:
                 loss.backward()
             loss_sum += loss.detach().item()
             processed += ids.numel() * world
         attn_grad, base_grad = norm(attn_params), norm(base_params)
-        if any(parameter.grad is not None for parameter in attn_params):
-            torch.nn.utils.clip_grad_norm_(attn_params, opt_cfg["max_grad_norm"])
+        trainable_params = base_params + attn_params
+        if any(parameter.grad is not None for parameter in trainable_params):
+            torch.nn.utils.clip_grad_norm_(trainable_params, opt_cfg["max_grad_norm"])
             optimizer.step()
         scheduler.step()
         if rank == 0 and step % cfg["logging"]["log_every_steps"] == 0:
-            metrics = {"train/loss": loss_sum, "train/tokens": processed, "train/lr": scheduler.get_last_lr()[0], "attn_res/scale": ar_scale, "grad_norm/attn_res": attn_grad, "grad_norm/base": base_grad, "system/max_memory_gb": torch.cuda.max_memory_allocated() / 2**30}
+            metrics = {
+                "train/loss": loss_sum,
+                "train/tokens": processed,
+                "train/lr_base": next((group["lr"] for group in optimizer.param_groups if group["name"] == "base"), 0.0),
+                "train/lr_attention_residuals": next((group["lr"] for group in optimizer.param_groups if group["name"] == "attention_residuals"), 0.0),
+                "attn_res/scale": ar_scale,
+                "grad_norm/attn_res": attn_grad,
+                "grad_norm/base": base_grad,
+                "system/max_memory_gb": torch.cuda.max_memory_allocated() / 2**30,
+            }
+            if capture_attention_maps:
+                metrics["attn_res/source_attention"] = attention_residual_image(
+                    model.module.model.last_attention_residual_maps,
+                    model.module.config.n_layers,
+                )
             run.log(metrics, step=step)
-            progress_bar.set_postfix(loss=f"{loss_sum:.4f}", lr=f"{metrics['train/lr']:.2e}", ar=f"{ar_scale:.3f}")
+            progress_bar.set_postfix(loss=f"{loss_sum:.4f}", lr=f"{metrics['train/lr_base']:.2e}/{metrics['train/lr_attention_residuals']:.2e}", ar=f"{ar_scale:.3f}")
             if step % 10 == 0:
-                tqdm.write(f"step={step}/{total_steps} tokens={processed:,} loss={loss_sum:.4f} lr={metrics['train/lr']:.3e} ar_scale={ar_scale:.4f}")
+                tqdm.write(
+                    f"step={step}/{total_steps} tokens={processed:,} loss={loss_sum:.4f} "
+                    f"lr_base={metrics['train/lr_base']:.3e} "
+                    f"lr_ar={metrics['train/lr_attention_residuals']:.3e} ar_scale={ar_scale:.4f}"
+                )
     if rank == 0: run.finish()
     dist.destroy_process_group()
 
