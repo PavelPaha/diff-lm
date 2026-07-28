@@ -1,11 +1,11 @@
 {
-  "run_name": "llada8b-fineweb-full-attn-res-only",
-  "git_commit": "ee85f829f2f5abf8d4b9db40f099253971e286c2",
+  "run_name": "llada8b-fineweb-full-attn-res-only-sft-schedule",
+  "git_commit": "e2b2f6ebad0d61f54e0db18e7b664e58431b642f",
   "seed": 42,
   "model": {
     "checkpoint": "/extra_disk_1/vasilievpavel/dlm-attn-res/huggingface/hub/models--GSAI-ML--LLaDA-8B-Base/snapshots/0f2787f2d87eac5eed8a087d5ecd24277e6255b2",
     "dtype": "bfloat16",
-    "context_length": 4096,
+    "context_length": 2048,
     "mask_token_id": 126336
   },
   "data": {
@@ -13,6 +13,7 @@
     "subset": null,
     "split": "train",
     "streaming": true,
+    "sequence_packing": false,
     "target_tokens": 18500000000000
   },
   "diffusion": {
@@ -21,20 +22,22 @@
   },
   "optimization": {
     "train_base_model": false,
-    "activation_checkpointing": "whole_layer",
-    "base_learning_rate": 5e-5,
-    "attention_residual_learning_rate": 5e-3,
+    "activation_checkpointing": null,
+    "base_learning_rate": 2.5e-5,
+    "attention_residual_learning_rate": 2.5e-5,
     "min_lr_ratio": 0.1,
-    "scheduler": "linear_warmup_cosine_decay",
-    "warmup_steps": 57787,
+    "scheduler": "linear_warmup_constant_linear_decay",
+    "warmup_steps": 50,
+    "decay_fraction": 0.1,
     "weight_decay": 0.1,
     "adam_beta1": 0.9,
     "adam_beta2": 0.95,
     "adam_eps": 1e-8,
     "zero_stage_1": false,
     "max_grad_norm": 1.0,
+    "global_batch_size_sequences": 48,
     "micro_batch_size": 1,
-    "gradient_accumulation_steps": 977
+    "gradient_accumulation_steps": 48
   },
   "attention_residuals": {
     "enabled": true,
@@ -42,8 +45,8 @@
     "scale_schedule": "linear_0_to_1"
   },
   "distributed": {
-    "cuda_visible_devices": "0,1",
-    "world_size": 2
+    "cuda_visible_devices": "2",
+    "world_size": 1
   },
   "logging": {
     "wandb_base_url": "https://wandb-radfan.ru",
@@ -51,6 +54,10 @@
     "wandb_project": "llada-attention-residuals",
     "log_every_steps": 1,
     "attention_maps_every_steps": 20,
+    "attention_residual_diagnostics": {
+      "enabled": true,
+      "every_steps": 20
+    },
     "checkpoint_every_steps": 500,
     "output_dir": "/extra_disk_1/vasilievpavel/dlm-attn-res/runs"
   }
