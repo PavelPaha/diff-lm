@@ -1,38 +1,44 @@
 {
-  "run_name": "llada8b-attn-res-fineweb-200m-s42",
-  "git_commit": "7258722978168324ac88eda82f0fdddddada4af5",
+  "run_name": "llada8b-fineweb-full-baseline",
+  "git_commit": null,
   "seed": 42,
   "model": {
     "checkpoint": "/extra_disk_1/vasilievpavel/dlm-attn-res/huggingface/hub/models--GSAI-ML--LLaDA-8B-Base/snapshots/0f2787f2d87eac5eed8a087d5ecd24277e6255b2",
     "dtype": "bfloat16",
-    "context_length": 2048,
+    "context_length": 4096,
     "mask_token_id": 126336
   },
   "data": {
     "dataset": "HuggingFaceFW/fineweb",
-    "subset": "sample-10BT",
+    "subset": null,
     "split": "train",
     "streaming": true,
-    "target_tokens": 200000000
+    "target_tokens": 18500000000000
+  },
+  "diffusion": {
+    "masking_epsilon": 0.001,
+    "random_length_probability": 0.01
   },
   "optimization": {
-    "train_base_model": false,
+    "train_base_model": true,
     "activation_checkpointing": "whole_layer",
-    "learning_rate": 1e-5,
+    "base_learning_rate": 5e-5,
+    "attention_residual_learning_rate": 5e-3,
     "min_lr_ratio": 0.1,
     "scheduler": "linear_warmup_cosine_decay",
-    "warmup_ratio": 0.03,
+    "warmup_steps": 57787,
     "weight_decay": 0.1,
     "adam_beta1": 0.9,
     "adam_beta2": 0.95,
     "adam_eps": 1e-8,
+    "zero_stage_1": true,
     "max_grad_norm": 1.0,
     "micro_batch_size": 1,
-    "gradient_accumulation_steps": 16
+    "gradient_accumulation_steps": 977
   },
   "attention_residuals": {
-    "enabled": true,
-    "warmup_steps": 1000,
+    "enabled": false,
+    "warmup_steps": 1,
     "scale_schedule": "linear_0_to_1"
   },
   "distributed": {
@@ -44,6 +50,7 @@
     "wandb_entity": "diff-lm",
     "wandb_project": "llada-attention-residuals",
     "log_every_steps": 1,
+    "attention_maps_every_steps": 20,
     "checkpoint_every_steps": 500,
     "output_dir": "/extra_disk_1/vasilievpavel/dlm-attn-res/runs"
   }

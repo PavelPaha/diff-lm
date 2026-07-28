@@ -1,0 +1,2 @@
+CUDA_VISIBLE_DEVICES=2,3 bash scripts/run_training_from_config.sh configs/fineweb_full_attn_res_only.json
+CUDA_VISIBLE_DEVICES=2,3 bash scripts/run_training_from_config.sh configs/fineweb_full_baseline.json

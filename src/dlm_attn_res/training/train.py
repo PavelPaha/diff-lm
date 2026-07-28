@@ -64,6 +64,26 @@ def attention_residual_image(source_maps, num_layers):
     )
 
 
+def packed_token_batch(iterator, tokenizer, token_buffer, batch_size, sequence_length):
+    """Return exact-length batches by concatenating FineWeb documents with EOS.
+
+    This is necessary for the configured global token batch to mean what it
+    says: truncating one document per micro-step otherwise produces a highly
+    variable, usually much shorter sequence.
+    """
+    tokens_needed = batch_size * sequence_length
+    eos_token_id = tokenizer.eos_token_id
+    if eos_token_id is None:
+        raise ValueError("The LLaDA tokenizer must define eos_token_id for packed pre-training data")
+    while len(token_buffer) < tokens_needed:
+        text = next(iterator)["text"]
+        token_buffer.extend(tokenizer(text, add_special_tokens=False)["input_ids"])
+        token_buffer.append(eos_token_id)
+    batch_tokens = token_buffer[:tokens_needed]
+    del token_buffer[:tokens_needed]
+    return torch.tensor(batch_tokens, dtype=torch.long).view(batch_size, sequence_length)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=Path, required=True)
@@ -80,6 +100,11 @@ def main():
 
     model_cfg = cfg["model"]
     opt_cfg, data_cfg = cfg["optimization"], cfg["data"]
+    diffusion_cfg = cfg.get("diffusion", {})
+    masking_epsilon = diffusion_cfg.get("masking_epsilon", 1e-3)
+    random_length_probability = diffusion_cfg.get("random_length_probability", 0.01)
+    if not 0.0 < masking_epsilon < 1.0:
+        raise ValueError("diffusion.masking_epsilon must be in (0, 1)")
     checkpoint = model_cfg["checkpoint"]
     tokenizer = AutoTokenizer.from_pretrained(checkpoint, local_files_only=True)
     config = LLaDAConfig.from_pretrained(checkpoint, local_files_only=True)
@@ -169,6 +194,7 @@ def main():
         streaming=True,
     ).shard(world, rank)
     iterator = iter(dataset)
+    token_buffer = []
     if rank == 0:
         run = wandb.init(entity=cfg["logging"]["wandb_entity"], project=cfg["logging"]["wandb_project"], name=cfg["run_name"], config=cfg, settings=wandb.Settings(base_url=cfg["logging"]["wandb_base_url"]))
         # Keep the exact input file in the run, not only its parsed key/value
@@ -185,15 +211,33 @@ def main():
     for step in progress_bar:
         optimizer.zero_grad(set_to_none=True)
         loss_sum = 0.0
+        mask_probability_sum = 0.0
+        masked_fraction_sum = 0.0
         for micro in range(opt_cfg["gradient_accumulation_steps"]):
-            text = next(iterator)["text"]
-            ids = tokenizer(text, truncation=True, max_length=context, return_tensors="pt")["input_ids"]
-            if ids.shape[1] < 2: continue
-            ids = ids.to(device)
-            rate = torch.rand((), device=device)
-            masked = torch.rand_like(ids.float()) < rate
-            masked[:, 0] = False
-            if not masked.any(): masked[0, -1] = True
+            ids = packed_token_batch(
+                iterator,
+                tokenizer,
+                token_buffer,
+                opt_cfg["micro_batch_size"],
+                context,
+            ).to(device)
+            # LLaDA uses a 4096-token block normally, and shortens 1% of
+            # blocks to a uniformly sampled length for length robustness.
+            if torch.rand((), device=device) < random_length_probability:
+                random_length = torch.randint(1, ids.shape[1] + 1, (), device=device).item()
+                ids = ids[:, :random_length]
+
+            # Sample one diffusion time per sequence, not one time for the
+            # whole batch. The epsilon prevents an exactly zero mask rate.
+            batch_size, sequence_length = ids.shape
+            p_mask = (1.0 - masking_epsilon) * torch.rand(batch_size, device=device) + masking_epsilon
+            masked = torch.rand((batch_size, sequence_length), device=device) < p_mask[:, None]
+            # With micro-batch one, a very small p_mask can occasionally
+            # produce no masked token. Make that edge case trainable instead
+            # of passing an empty tensor to cross_entropy.
+            for row in range(batch_size):
+                if not masked[row].any():
+                    masked[row, torch.randint(sequence_length, (), device=device)] = True
             corrupted = ids.masked_fill(masked, mask_id)
             ar_scale = min(step / cfg["attention_residuals"]["warmup_steps"], 1.0)
             capture_attention_maps = (
@@ -210,10 +254,17 @@ def main():
                     attention_residual_scale=ar_scale,
                     capture_attention_residual_maps=capture_attention_maps,
                 ).logits
-                loss = F.cross_entropy(logits[masked], ids[masked]) / opt_cfg["gradient_accumulation_steps"]
+                token_loss = F.cross_entropy(logits[masked], ids[masked], reduction="none")
+                token_loss = token_loss / p_mask[:, None].expand_as(ids)[masked]
+                # This is the LLaDA pre-training objective: normalize by all
+                # positions, rather than the variable number of masked ones.
+                loss = token_loss.sum() / (batch_size * sequence_length)
+                loss = loss / opt_cfg["gradient_accumulation_steps"]
             if loss.requires_grad:
                 loss.backward()
             loss_sum += loss.detach().item()
+            mask_probability_sum += p_mask.mean().item()
+            masked_fraction_sum += masked.float().mean().item()
             processed += ids.numel() * world
         attn_grad, base_grad = norm(attn_params), norm(base_params)
         trainable_params = base_params + attn_params
@@ -225,6 +276,8 @@ def main():
             metrics = {
                 "train/loss": loss_sum,
                 "train/tokens": processed,
+                "train/mask_probability": mask_probability_sum / opt_cfg["gradient_accumulation_steps"],
+                "train/masked_fraction": masked_fraction_sum / opt_cfg["gradient_accumulation_steps"],
                 "train/lr_base": next((group["lr"] for group in optimizer.param_groups if group["name"] == "base"), 0.0),
                 "train/lr_attention_residuals": next((group["lr"] for group in optimizer.param_groups if group["name"] == "attention_residuals"), 0.0),
                 "attn_res/scale": ar_scale,
