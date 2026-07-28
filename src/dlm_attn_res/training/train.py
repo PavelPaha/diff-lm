@@ -11,6 +11,7 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from datasets import load_dataset
 from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.distributed.optim import ZeroRedundancyOptimizer
 from transformers import AutoTokenizer
 import wandb
 from tqdm.auto import tqdm
@@ -74,7 +75,15 @@ def main():
     model.train()
     # At scale=0 the AR branch is intentionally absent from the graph, so its
     # parameters are temporarily unused.
-    model = DDP(model, device_ids=[local_rank], broadcast_buffers=False, find_unused_parameters=True)
+    model = DDP(
+        model,
+        device_ids=[local_rank],
+        broadcast_buffers=False,
+        find_unused_parameters=True,
+        # Reuse DDP's all-reduce buckets as gradient storage after the first
+        # iteration instead of allocating a second full gradient buffer.
+        gradient_as_bucket_view=True,
+    )
 
     attn_params = [
         parameter for name, parameter in model.named_parameters()
@@ -99,11 +108,20 @@ def main():
             "weight_decay": opt_cfg["weight_decay"],
             "name": "attention_residuals",
         })
-    optimizer = torch.optim.AdamW(
-        parameter_groups,
-        betas=(opt_cfg["adam_beta1"], opt_cfg["adam_beta2"]),
-        eps=opt_cfg["adam_eps"],
-    )
+    optimizer_kwargs = {
+        "betas": (opt_cfg["adam_beta1"], opt_cfg["adam_beta2"]),
+        "eps": opt_cfg["adam_eps"],
+    }
+    if opt_cfg.get("zero_stage_1", False):
+        # DDP replicates model parameters, but this shards Adam's m/v state
+        # across ranks. For an 8B model that saves roughly 32 GiB per H200.
+        optimizer = ZeroRedundancyOptimizer(
+            parameter_groups,
+            optimizer_class=torch.optim.AdamW,
+            **optimizer_kwargs,
+        )
+    else:
+        optimizer = torch.optim.AdamW(parameter_groups, **optimizer_kwargs)
     tokens_per_step = world * opt_cfg["micro_batch_size"] * model_cfg["context_length"] * opt_cfg["gradient_accumulation_steps"]
     total_steps = math.ceil(data_cfg["target_tokens"] / tokens_per_step)
     warmup_steps = max(1, round(total_steps * opt_cfg["warmup_ratio"]))
