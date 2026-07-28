@@ -27,7 +27,7 @@
     "attention_residual_learning_rate": 2.5e-5,
     "min_lr_ratio": 0.1,
     "scheduler": "linear_warmup_constant_linear_decay",
-    "warmup_steps": 50,
+    "warmup_steps": 300,
     "decay_fraction": 0.1,
     "weight_decay": 0.1,
     "adam_beta1": 0.9,
