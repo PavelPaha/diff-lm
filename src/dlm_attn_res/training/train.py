@@ -25,6 +25,29 @@ def norm(parameters):
     return torch.stack(values).sum().sqrt().item() if values else 0.0
 
 
+def parameter_norm(parameter):
+    return parameter.detach().float().norm().item()
+
+
+def attention_residual_layer_metrics(model, include_gradients):
+    """Return compact per-layer diagnostics for the inserted AttnRes modules."""
+    metrics = {}
+    for layer_idx, block in enumerate(model.model.transformer.blocks):
+        prefix = f"attn_res/layer_{layer_idx:02d}"
+        pseudo_query = block.attn_res.pseudo_query
+        output_norm_weight = block.norm.weight
+        metrics[f"{prefix}/pseudo_query_norm"] = parameter_norm(pseudo_query)
+        metrics[f"{prefix}/output_rmsnorm_weight_norm"] = parameter_norm(output_norm_weight)
+        if include_gradients:
+            metrics[f"{prefix}/pseudo_query_grad_norm"] = (
+                parameter_norm(pseudo_query.grad) if pseudo_query.grad is not None else 0.0
+            )
+            metrics[f"{prefix}/output_rmsnorm_weight_grad_norm"] = (
+                parameter_norm(output_norm_weight.grad) if output_norm_weight.grad is not None else 0.0
+            )
+    return metrics
+
+
 def attention_residual_image(source_maps, num_layers):
     """Render depth-wise AR routing as an explicit RGB heatmap.
 
@@ -64,24 +87,21 @@ def attention_residual_image(source_maps, num_layers):
     )
 
 
-def packed_token_batch(iterator, tokenizer, token_buffer, batch_size, sequence_length):
-    """Return exact-length batches by concatenating FineWeb documents with EOS.
+def document_token_batch(iterator, tokenizer, batch_size, sequence_length):
+    """Return independent documents padded/truncated to a fixed sequence length.
 
-    This is necessary for the configured global token batch to mean what it
-    says: truncating one document per micro-step otherwise produces a highly
-    variable, usually much shorter sequence.
+    We deliberately do not concatenate documents: a row in the batch is one
+    FineWeb document. Padding is carried in `attention_mask` and excluded from
+    corruption, loss, and processed-token accounting.
     """
-    tokens_needed = batch_size * sequence_length
-    eos_token_id = tokenizer.eos_token_id
-    if eos_token_id is None:
-        raise ValueError("The LLaDA tokenizer must define eos_token_id for packed pre-training data")
-    while len(token_buffer) < tokens_needed:
-        text = next(iterator)["text"]
-        token_buffer.extend(tokenizer(text, add_special_tokens=False)["input_ids"])
-        token_buffer.append(eos_token_id)
-    batch_tokens = token_buffer[:tokens_needed]
-    del token_buffer[:tokens_needed]
-    return torch.tensor(batch_tokens, dtype=torch.long).view(batch_size, sequence_length)
+    texts = [next(iterator)["text"] for _ in range(batch_size)]
+    return tokenizer(
+        texts,
+        truncation=True,
+        max_length=sequence_length,
+        padding="max_length",
+        return_tensors="pt",
+    )
 
 
 def main():
@@ -107,6 +127,10 @@ def main():
         raise ValueError("diffusion.masking_epsilon must be in (0, 1)")
     checkpoint = model_cfg["checkpoint"]
     tokenizer = AutoTokenizer.from_pretrained(checkpoint, local_files_only=True)
+    if tokenizer.pad_token_id is None:
+        if tokenizer.eos_token_id is None:
+            raise ValueError("LLaDA tokenizer must define a pad_token_id or eos_token_id")
+        tokenizer.pad_token = tokenizer.eos_token
     config = LLaDAConfig.from_pretrained(checkpoint, local_files_only=True)
     model = LLaDAModelLM.from_pretrained(checkpoint, config=config, torch_dtype=torch.bfloat16).to(device)
     if opt_cfg["activation_checkpointing"]:
@@ -181,10 +205,30 @@ def main():
         warmup_steps = int(warmup_steps)
         if not 0 < warmup_steps < total_steps:
             raise ValueError(f"warmup_steps must be in [1, {total_steps - 1}], got {warmup_steps}")
+
+    expected_global_batch_size = opt_cfg.get("global_batch_size_sequences")
+    actual_global_batch_size = world * opt_cfg["micro_batch_size"] * opt_cfg["gradient_accumulation_steps"]
+    if expected_global_batch_size is not None and expected_global_batch_size != actual_global_batch_size:
+        raise ValueError(
+            "global batch mismatch: config requests "
+            f"{expected_global_batch_size}, but world_size * micro_batch_size * "
+            f"gradient_accumulation_steps = {actual_global_batch_size}"
+        )
+
+    scheduler_name = opt_cfg["scheduler"]
     def factor(step):
         if step < warmup_steps: return (step + 1) / warmup_steps
-        progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
-        return opt_cfg["min_lr_ratio"] + (1 - opt_cfg["min_lr_ratio"]) * .5 * (1 + math.cos(math.pi * progress))
+        if scheduler_name == "linear_warmup_cosine_decay":
+            progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
+            return opt_cfg["min_lr_ratio"] + (1 - opt_cfg["min_lr_ratio"]) * .5 * (1 + math.cos(math.pi * progress))
+        if scheduler_name == "linear_warmup_constant_linear_decay":
+            decay_steps = max(1, math.ceil(total_steps * opt_cfg["decay_fraction"]))
+            decay_start = total_steps - decay_steps
+            if step < decay_start:
+                return 1.0
+            decay_progress = (step - decay_start + 1) / decay_steps
+            return 1.0 - (1.0 - opt_cfg["min_lr_ratio"]) * decay_progress
+        raise ValueError(f"Unsupported scheduler: {scheduler_name}")
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, factor)
 
     dataset = load_dataset(
@@ -194,7 +238,6 @@ def main():
         streaming=True,
     ).shard(world, rank)
     iterator = iter(dataset)
-    token_buffer = []
     if rank == 0:
         run = wandb.init(entity=cfg["logging"]["wandb_entity"], project=cfg["logging"]["wandb_project"], name=cfg["run_name"], config=cfg, settings=wandb.Settings(base_url=cfg["logging"]["wandb_base_url"]))
         # Keep the exact input file in the run, not only its parsed key/value
@@ -202,6 +245,11 @@ def main():
         run.save(str(args.config), base_path=str(args.config.parent), policy="now")
     context, mask_id, processed = model_cfg["context_length"], model_cfg["mask_token_id"], 0
     attention_map_every = cfg["logging"].get("attention_maps_every_steps", 20)
+    diagnostics_cfg = cfg["logging"].get("attention_residual_diagnostics", {})
+    diagnostics_enabled = diagnostics_cfg.get("enabled", False)
+    diagnostics_every = int(diagnostics_cfg.get("every_steps", 20))
+    if diagnostics_enabled and diagnostics_every < 1:
+        raise ValueError("logging.attention_residual_diagnostics.every_steps must be positive")
     progress_bar = tqdm(
         range(total_steps),
         disable=rank != 0,
@@ -214,30 +262,34 @@ def main():
         mask_probability_sum = 0.0
         masked_fraction_sum = 0.0
         for micro in range(opt_cfg["gradient_accumulation_steps"]):
-            ids = packed_token_batch(
+            batch = document_token_batch(
                 iterator,
                 tokenizer,
-                token_buffer,
                 opt_cfg["micro_batch_size"],
                 context,
-            ).to(device)
+            )
+            ids = batch["input_ids"].to(device)
+            attention_mask = batch["attention_mask"].to(device)
             # LLaDA uses a 4096-token block normally, and shortens 1% of
             # blocks to a uniformly sampled length for length robustness.
             if torch.rand((), device=device) < random_length_probability:
                 random_length = torch.randint(1, ids.shape[1] + 1, (), device=device).item()
                 ids = ids[:, :random_length]
+                attention_mask = attention_mask[:, :random_length]
 
             # Sample one diffusion time per sequence, not one time for the
             # whole batch. The epsilon prevents an exactly zero mask rate.
             batch_size, sequence_length = ids.shape
             p_mask = (1.0 - masking_epsilon) * torch.rand(batch_size, device=device) + masking_epsilon
-            masked = torch.rand((batch_size, sequence_length), device=device) < p_mask[:, None]
+            valid_tokens = attention_mask.bool()
+            masked = (torch.rand((batch_size, sequence_length), device=device) < p_mask[:, None]) & valid_tokens
             # With micro-batch one, a very small p_mask can occasionally
             # produce no masked token. Make that edge case trainable instead
             # of passing an empty tensor to cross_entropy.
             for row in range(batch_size):
                 if not masked[row].any():
-                    masked[row, torch.randint(sequence_length, (), device=device)] = True
+                    valid_positions = valid_tokens[row].nonzero(as_tuple=True)[0]
+                    masked[row, valid_positions[torch.randint(valid_positions.numel(), (), device=device)]] = True
             corrupted = ids.masked_fill(masked, mask_id)
             ar_scale = min(step / cfg["attention_residuals"]["warmup_steps"], 1.0)
             capture_attention_maps = (
@@ -247,31 +299,54 @@ def main():
                 and step % attention_map_every == 0
                 and micro == opt_cfg["gradient_accumulation_steps"] - 1
             )
+            capture_attention_residual_diagnostics = (
+                rank == 0
+                and diagnostics_enabled
+                and cfg["attention_residuals"]["enabled"]
+                and ar_scale > 0.0
+                and step % diagnostics_every == 0
+                and micro == opt_cfg["gradient_accumulation_steps"] - 1
+            )
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 logits = model(
                     input_ids=corrupted,
+                    attention_mask=attention_mask,
                     use_attention_residuals=cfg["attention_residuals"]["enabled"],
                     attention_residual_scale=ar_scale,
                     capture_attention_residual_maps=capture_attention_maps,
+                    capture_attention_residual_diagnostics=capture_attention_residual_diagnostics,
                 ).logits
                 token_loss = F.cross_entropy(logits[masked], ids[masked], reduction="none")
                 token_loss = token_loss / p_mask[:, None].expand_as(ids)[masked]
-                # This is the LLaDA pre-training objective: normalize by all
-                # positions, rather than the variable number of masked ones.
-                loss = token_loss.sum() / (batch_size * sequence_length)
+                # With document-level padding, normalize by real tokens only.
+                loss = token_loss.sum() / valid_tokens.sum()
                 loss = loss / opt_cfg["gradient_accumulation_steps"]
             if loss.requires_grad:
                 loss.backward()
             loss_sum += loss.detach().item()
             mask_probability_sum += p_mask.mean().item()
-            masked_fraction_sum += masked.float().mean().item()
-            processed += ids.numel() * world
-        attn_grad, base_grad = norm(attn_params), norm(base_params)
+            masked_fraction_sum += (masked.sum() / valid_tokens.sum()).item()
+            processed += valid_tokens.sum().item() * world
+        attn_grad_pre_clip, base_grad_pre_clip = norm(attn_params), norm(base_params)
+        layer_gradients_pre_clip = (
+            attention_residual_layer_metrics(model.module, include_gradients=True)
+            if capture_attention_residual_diagnostics else {}
+        )
         trainable_params = base_params + attn_params
+        attn_grad_post_clip, base_grad_post_clip = attn_grad_pre_clip, base_grad_pre_clip
+        gradient_clip_ratio = 1.0
         if any(parameter.grad is not None for parameter in trainable_params):
             torch.nn.utils.clip_grad_norm_(trainable_params, opt_cfg["max_grad_norm"])
+            attn_grad_post_clip, base_grad_post_clip = norm(attn_params), norm(base_params)
+            combined_pre_clip = math.hypot(attn_grad_pre_clip, base_grad_pre_clip)
+            combined_post_clip = math.hypot(attn_grad_post_clip, base_grad_post_clip)
+            if combined_pre_clip > 0.0:
+                gradient_clip_ratio = combined_post_clip / combined_pre_clip
             optimizer.step()
-        scheduler.step()
+            # Keep scheduler updates aligned with actual optimizer updates.
+            # In AR-only training, scale=0 initially leaves all trainable AR
+            # parameters outside the graph, so there is no optimizer step.
+            scheduler.step()
         if rank == 0 and step % cfg["logging"]["log_every_steps"] == 0:
             metrics = {
                 "train/loss": loss_sum,
@@ -281,8 +356,12 @@ def main():
                 "train/lr_base": next((group["lr"] for group in optimizer.param_groups if group["name"] == "base"), 0.0),
                 "train/lr_attention_residuals": next((group["lr"] for group in optimizer.param_groups if group["name"] == "attention_residuals"), 0.0),
                 "attn_res/scale": ar_scale,
-                "grad_norm/attn_res": attn_grad,
-                "grad_norm/base": base_grad,
+                "grad_norm/attn_res": attn_grad_post_clip,
+                "grad_norm/base": base_grad_post_clip,
+                "grad_norm/attn_res_pre_clip": attn_grad_pre_clip,
+                "grad_norm/base_pre_clip": base_grad_pre_clip,
+                "grad_clip/global_ratio": gradient_clip_ratio,
+                "grad_clip/max_norm": opt_cfg["max_grad_norm"],
                 "system/max_memory_gb": torch.cuda.max_memory_allocated() / 2**30,
             }
             if capture_attention_maps:
@@ -290,6 +369,16 @@ def main():
                     model.module.model.last_attention_residual_maps,
                     model.module.config.n_layers,
                 )
+            if capture_attention_residual_diagnostics:
+                for layer_idx, values in enumerate(model.module.model.last_attention_residual_diagnostics):
+                    metrics.update({f"attn_res/layer_{layer_idx:02d}/{name}": value for name, value in values.items()})
+                metrics.update(layer_gradients_pre_clip)
+                layer_gradients_post_clip = attention_residual_layer_metrics(
+                    model.module, include_gradients=True
+                )
+                for name, value in layer_gradients_post_clip.items():
+                    if name.endswith("_grad_norm"):
+                        metrics[f"{name}_post_clip"] = value
             run.log(metrics, step=step)
             progress_bar.set_postfix(loss=f"{loss_sum:.4f}", lr=f"{metrics['train/lr_base']:.2e}/{metrics['train/lr_attention_residuals']:.2e}", ar=f"{ar_scale:.3f}")
             if step % 10 == 0:
