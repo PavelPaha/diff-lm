@@ -29,12 +29,20 @@ def parameter_norm(parameter):
     return parameter.detach().float().norm().item()
 
 
+def attention_residual_operators(model):
+    """Yield Full AttnRes operators in forward order."""
+    for block_idx, block in enumerate(model.model.transformer.blocks):
+        yield f"sublayer_{2 * block_idx:02d}_attention", block.attn_res_attention
+        yield f"sublayer_{2 * block_idx + 1:02d}_mlp", block.attn_res_mlp
+    yield "output", model.model.output_attn_res
+
+
 def attention_residual_layer_metrics(model, include_gradients):
-    """Return compact per-layer diagnostics for the inserted AttnRes modules."""
+    """Return compact per-sub-layer diagnostics for Full AttnRes."""
     metrics = {}
-    for layer_idx, block in enumerate(model.model.transformer.blocks):
-        prefix = f"attn_res/layer_{layer_idx:02d}"
-        pseudo_query = block.attn_res.pseudo_query
+    for route_name, operator in attention_residual_operators(model):
+        prefix = f"attn_res/{route_name}"
+        pseudo_query = operator.pseudo_query
         metrics[f"{prefix}/pseudo_query_norm"] = parameter_norm(pseudo_query)
         if include_gradients:
             metrics[f"{prefix}/pseudo_query_grad_norm"] = (
@@ -51,26 +59,26 @@ def transformer_layer_gradient_metrics(model):
     }
 
 
-def attention_residual_image(source_maps, num_layers):
+def attention_residual_image(source_maps, num_routes):
     """Render depth-wise AR routing as an explicit RGB heatmap.
 
-    Row `i` is the residual routing used before transformer block `i`; column
-    `j` is the source representation from depth `j`. Colors show the weight
+    Row `i` is routing before an Attention/MLP sub-layer (plus output); column
+    `j` is a raw source output from depth `j`. Colors show the weight
     *relative to uniform routing* in that row: grey = uniform, red = preferred
     source, blue = suppressed source. This makes small weights visible and
     avoids W&B/Pillow treating NaNs outside the triangle as black pixels.
     """
-    routing = np.zeros((num_layers, num_layers), dtype=np.float32)
-    valid = np.zeros((num_layers, num_layers), dtype=bool)
-    for block_idx, weights in enumerate(source_maps):
+    routing = np.zeros((num_routes, num_routes), dtype=np.float32)
+    valid = np.zeros((num_routes, num_routes), dtype=bool)
+    for route_idx, weights in enumerate(source_maps):
         count = weights.numel()
         # `weights * count - 1` is zero for an exactly uniform distribution.
-        routing[block_idx, :count] = weights.numpy() * count - 1.0
-        valid[block_idx, :count] = True
+        routing[route_idx, :count] = weights.numpy() * count - 1.0
+        valid[route_idx, :count] = True
 
     max_deviation = max(float(np.abs(routing[valid]).max(initial=0.0)), 1e-6)
     normalized = np.clip(routing / max_deviation, -1.0, 1.0)
-    rgb = np.full((num_layers, num_layers, 3), 42, dtype=np.uint8)
+    rgb = np.full((num_routes, num_routes, 3), 42, dtype=np.uint8)
     # A compact diverging palette: blue -> neutral grey -> red.
     positive = normalized >= 0
     rgb[..., 0][valid] = 180
@@ -86,11 +94,11 @@ def attention_residual_image(source_maps, num_layers):
     rgb[..., 2][negative] = 180 + (75 * magnitude).astype(np.uint8)
     return wandb.Image(
         rgb,
-        caption="Attention Residual routing: row=target block, column=source depth; grey=uniform, red=preferred, blue=suppressed",
+        caption="Full AttnRes routing: row=target sub-layer/output, column=raw source depth; grey=uniform, red=preferred, blue=suppressed",
     )
 
 
-def attention_residual_raw_image(source_maps, num_layers, scale_max=1.0, caption_prefix=""):
+def attention_residual_raw_image(source_maps, num_routes, scale_max=1.0, caption_prefix=""):
     """Render raw post-softmax routing weights with a fixed cross-step scale.
 
     Blue is zero and red is ``scale_max``. Unlike
@@ -99,15 +107,15 @@ def attention_residual_raw_image(source_maps, num_layers, scale_max=1.0, caption
     """
     if scale_max <= 0.0:
         raise ValueError("raw routing heatmap scale_max must be positive")
-    routing = np.zeros((num_layers, num_layers), dtype=np.float32)
-    valid = np.zeros((num_layers, num_layers), dtype=bool)
-    for block_idx, weights in enumerate(source_maps):
+    routing = np.zeros((num_routes, num_routes), dtype=np.float32)
+    valid = np.zeros((num_routes, num_routes), dtype=bool)
+    for route_idx, weights in enumerate(source_maps):
         count = weights.numel()
-        routing[block_idx, :count] = weights.numpy()
-        valid[block_idx, :count] = True
+        routing[route_idx, :count] = weights.numpy()
+        valid[route_idx, :count] = True
 
     normalized = np.clip(routing / scale_max, 0.0, 1.0)
-    rgb = np.full((num_layers, num_layers, 3), 36, dtype=np.uint8)
+    rgb = np.full((num_routes, num_routes, 3), 36, dtype=np.uint8)
     values = normalized[valid]
     # Fixed blue -> cyan/yellow -> red palette.
     rgb[..., 0][valid] = (255 * np.clip(2.0 * values - 0.5, 0.0, 1.0)).astype(np.uint8)
@@ -118,7 +126,7 @@ def attention_residual_raw_image(source_maps, num_layers, scale_max=1.0, caption
         rgb,
         caption=(
             f"{prefix}raw post-softmax routing weights; fixed scale [0, {scale_max:g}]; "
-            "row=target block, column=source depth"
+            "row=target sub-layer/output, column=raw source depth"
         ),
     )
 
@@ -274,7 +282,7 @@ def heldout_routing_metrics(
                 all_token_counts.append(attention_mask.sum().item())
 
             ratio_name = f"{ratio:.2f}"
-            num_layers = module.config.n_layers
+            num_routes = 2 * module.config.n_layers + 1
             averaged_maps = {
                 "all": average_source_maps(all_map_sets, all_token_counts),
                 "masked": average_source_maps(masked_map_sets, masked_token_counts),
@@ -282,19 +290,19 @@ def heldout_routing_metrics(
             }
             metrics[f"attn_res/heldout/mask_{ratio_name}/all/raw_weights"] = attention_residual_raw_image(
                 averaged_maps["all"],
-                num_layers,
+                num_routes,
                 raw_scale_max,
                 caption_prefix=f"held-out mask ratio={ratio_name}, all valid tokens",
             )
             metrics[f"attn_res/heldout/mask_{ratio_name}/masked/raw_weights"] = attention_residual_raw_image(
                 averaged_maps["masked"],
-                num_layers,
+                num_routes,
                 raw_scale_max,
                 caption_prefix=f"held-out mask ratio={ratio_name}, masked tokens",
             )
             metrics[f"attn_res/heldout/mask_{ratio_name}/visible/raw_weights"] = attention_residual_raw_image(
                 averaged_maps["visible"],
-                num_layers,
+                num_routes,
                 raw_scale_max,
                 caption_prefix=f"held-out mask ratio={ratio_name}, visible tokens",
             )
@@ -326,6 +334,9 @@ def main():
 
     model_cfg = cfg["model"]
     opt_cfg, data_cfg = cfg["optimization"], cfg["data"]
+    attention_residual_cfg = cfg["attention_residuals"]
+    if attention_residual_cfg["enabled"] and attention_residual_cfg.get("mode", "full") != "full":
+        raise ValueError("Only paper-style Full AttnRes mode is supported")
     diffusion_cfg = cfg.get("diffusion", {})
     masking_epsilon = diffusion_cfg.get("masking_epsilon", 1e-3)
     random_length_probability = diffusion_cfg.get("random_length_probability", 0.01)
@@ -587,6 +598,10 @@ def main():
             list(model.module.model.last_attention_residual_diagnostics)
             if capture_attention_residual_diagnostics else []
         )
+        training_route_names = (
+            list(model.module.model.last_attention_residual_route_names)
+            if capture_attention_residual_diagnostics else []
+        )
         training_layer_diagnostics = (
             list(model.module.model.last_layer_diagnostics) if capture_layer_diagnostics else []
         )
@@ -650,25 +665,26 @@ def main():
                 "system/max_memory_gb": torch.cuda.max_memory_allocated() / 2**30,
             }
             if capture_attention_maps:
+                num_routes = 2 * model.module.config.n_layers + 1
                 metrics["attn_res/source_attention"] = attention_residual_image(
                     training_attention_maps,
-                    model.module.config.n_layers,
+                    num_routes,
                 )
                 metrics["attn_res/train/all/raw_weights"] = attention_residual_raw_image(
                     training_attention_maps,
-                    model.module.config.n_layers,
+                    num_routes,
                     routing_raw_scale_max,
                     caption_prefix="training batch, all valid tokens",
                 )
                 metrics["attn_res/train/masked/raw_weights"] = attention_residual_raw_image(
                     training_masked_maps,
-                    model.module.config.n_layers,
+                    num_routes,
                     routing_raw_scale_max,
                     caption_prefix="training batch, masked tokens",
                 )
                 metrics["attn_res/train/visible/raw_weights"] = attention_residual_raw_image(
                     training_visible_maps,
-                    model.module.config.n_layers,
+                    num_routes,
                     routing_raw_scale_max,
                     caption_prefix="training batch, visible tokens",
                 )
@@ -679,8 +695,11 @@ def main():
                 }.items():
                     metrics.update(routing_summary_metrics(maps, f"attn_res/train/{token_group}"))
             if capture_attention_residual_diagnostics:
-                for layer_idx, values in enumerate(training_attention_diagnostics):
-                    metrics.update({f"attn_res/layer_{layer_idx:02d}/{name}": value for name, value in values.items()})
+                for route_name, values in zip(training_route_names, training_attention_diagnostics):
+                    metrics.update({
+                        f"attn_res/{route_name}/{name}": value
+                        for name, value in values.items()
+                    })
                 metrics.update(layer_gradients_pre_clip)
                 layer_gradients_post_clip = attention_residual_layer_metrics(
                     model.module, include_gradients=True

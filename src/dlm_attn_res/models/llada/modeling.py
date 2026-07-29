@@ -563,10 +563,11 @@ class LLaDABlock(nn.Module):
             )
             self.q_norm = LayerNormBase.build(config, elementwise_affine=config.attention_layer_norm_with_affine)
 
-        # The operator normalizes keys for routing, but routed values retain
-        # their residual-stream scale. A post-AttnRes RMSNorm would force that
-        # scale to one and destabilize a pretrained model.
-        self.attn_res = AttnResOperator(config.d_model)
+        # Full AttnRes treats Attention and MLP as two distinct layers.  Each
+        # receives its own pseudo-query and attends over the embedding plus all
+        # preceding raw sub-layer outputs.
+        self.attn_res_attention = AttnResOperator(config.d_model)
+        self.attn_res_mlp = AttnResOperator(config.d_model)
 
         # Activation function.
         self.act = Activation.build(config)
@@ -800,7 +801,7 @@ class LLaDASequentialBlock(LLaDABlock):
             self.config, self.ff_proj, d=self.config.d_model, layer_id=None, type_of_module=ModuleType.in_module
         )
 
-    def forward(
+    def forward_attention_sublayer(
         self,
         x: torch.Tensor,
         attention_bias: Optional[torch.Tensor] = None,
@@ -829,13 +830,10 @@ class LLaDASequentialBlock(LLaDABlock):
         else:
             att, cache = self.attention(q, k, v, attention_bias, layer_past=layer_past, use_cache=use_cache)
 
-        # Add attention scores.
-        # shape: (B, T, C)
-        x = x + self.dropout(att)
+        return self.dropout(att), cache
 
-        # Add feed-forward projection.
-        # shape: (batch_size, seq_len, d_model)
-        og_x = x
+    def forward_mlp_sublayer(self, x: torch.Tensor) -> torch.Tensor:
+        """Return the raw MLP output, without adding a residual connection."""
         if self._activation_checkpoint_fn is not None:
             x = self._activation_checkpoint_fn(self.ff_norm, x)  # type: ignore
         else:
@@ -847,8 +845,23 @@ class LLaDASequentialBlock(LLaDABlock):
             x = self.act(x)
         x = self.ff_out(x)
         x = self.dropout(x)
-        x = og_x + x
+        return x
 
+    def forward(
+        self,
+        x: torch.Tensor,
+        attention_bias: Optional[torch.Tensor] = None,
+        layer_past: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        use_cache: bool = False,
+    ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
+        attn_output, cache = self.forward_attention_sublayer(
+            x,
+            attention_bias=attention_bias,
+            layer_past=layer_past,
+            use_cache=use_cache,
+        )
+        x = x + attn_output
+        x = x + self.forward_mlp_sublayer(x)
         return x, cache
 
 
@@ -902,7 +915,7 @@ class LLaDALlamaBlock(LLaDABlock):
         init_weights(self.config, self.ff_proj, d=self.config.d_model, layer_id=None)
         init_weights(self.config, self.up_proj, d=self.config.d_model, layer_id=None)  # new add
 
-    def forward(
+    def forward_attention_sublayer(
         self,
         x: torch.Tensor,
         attention_bias: Optional[torch.Tensor] = None,
@@ -929,13 +942,10 @@ class LLaDALlamaBlock(LLaDABlock):
         else:
             att, cache = self.attention(q, k, v, attention_bias, layer_past=layer_past, use_cache=use_cache)
 
-        # Add attention scores.
-        # shape: (B, T, C)
-        x = x + self.dropout(att)
+        return self.dropout(att), cache
 
-        # Add feed-forward projection.
-        # shape: (batch_size, seq_len, d_model)
-        og_x = x
+    def forward_mlp_sublayer(self, x: torch.Tensor) -> torch.Tensor:
+        """Return the raw SwiGLU MLP output, without a residual addition."""
         if self._activation_checkpoint_fn is not None:
             x = self._activation_checkpoint_fn(self.ff_norm, x)  # type: ignore
         else:
@@ -948,8 +958,23 @@ class LLaDALlamaBlock(LLaDABlock):
         x = x * x_up # new add
         x = self.ff_out(x)
         x = self.dropout(x)
-        x = og_x + x
+        return x
 
+    def forward(
+        self,
+        x: torch.Tensor,
+        attention_bias: Optional[torch.Tensor] = None,
+        layer_past: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        use_cache: bool = False,
+    ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
+        attn_output, cache = self.forward_attention_sublayer(
+            x,
+            attention_bias=attention_bias,
+            layer_past=layer_past,
+            use_cache=use_cache,
+        )
+        x = x + attn_output
+        x = x + self.forward_mlp_sublayer(x)
         return x, cache
 
 
@@ -1099,6 +1124,9 @@ class LLaDAModel(nn.Module):
                 ln_f=LayerNorm.build(config),
             )
         )
+        # The output layer is also a target in Full AttnRes (Figure 1b in the
+        # paper), so it has a separate depth-routing pseudo-query.
+        self.output_attn_res = AttnResOperator(config.d_model)
 
         blocks = [LLaDABlock.build(i, config, self.__cache) for i in range(config.n_layers)]
         if self.config.block_group_size > 1:
@@ -1340,132 +1368,217 @@ class LLaDAModel(nn.Module):
 
         # Attention over residual sources is a depth-wise distribution, not the
         # usual token-to-token attention.  When requested by the trainer we
-        # retain only its batch/token average for each target block.  Keeping
-        # the full [sources, batch, tokens] tensor would be prohibitively large.
+        # retain only its batch/token average for each target sub-layer.
         self.last_attention_residual_maps = []
         self.last_attention_residual_masked_maps = []
         self.last_attention_residual_visible_maps = []
         self.last_attention_residual_diagnostics = []
+        self.last_attention_residual_route_names = []
         self.last_layer_diagnostics = []
 
         # Apply blocks one-by-one.
         if self.config.block_group_size == 1:
             attention_residual_scale = float(max(0.0, min(1.0, attention_residual_scale)))
-            attention_residual_history = [x] if use_attention_residuals else None
+            full_attnres_active = use_attention_residuals and attention_residual_scale > 0.0
+            if full_attnres_active and self.activation_checkpointing_strategy in {
+                ActivationCheckpointingStrategy.whole_layer,
+                ActivationCheckpointingStrategy.one_in_two,
+                ActivationCheckpointingStrategy.one_in_three,
+                ActivationCheckpointingStrategy.one_in_four,
+            }:
+                raise ValueError(
+                    "Full AttnRes splits each Transformer block into Attention and MLP "
+                    "sub-layers and is incompatible with whole-block activation checkpointing"
+                )
+
+            def route_full_attention_residual(
+                operator: AttnResOperator,
+                source_outputs: List[torch.Tensor],
+                standard_residual_sum: torch.Tensor,
+                route_name: str,
+            ) -> torch.Tensor:
+                """Route all raw preceding sub-layer outputs as in Full AttnRes."""
+                if self.training and torch.is_grad_enabled():
+                    # A naive PyTorch graph retains a stacked [depth, B, T, D]
+                    # tensor plus normalized keys for every route, turning the
+                    # theoretical O(LD) storage into O(L²D). Recompute only the
+                    # cheap depth-routing operation in backward while keeping
+                    # all expensive Transformer sub-layers uncheckpointed.
+                    from torch.utils.checkpoint import checkpoint
+
+                    def run_operator(*values: torch.Tensor) -> torch.Tensor:
+                        return operator(torch.stack(values, dim=0))
+
+                    routed_input = checkpoint(
+                        run_operator,
+                        *source_outputs,
+                        use_reentrant=False,
+                        preserve_rng_state=False,
+                    )
+                else:
+                    routed_input = operator(torch.stack(source_outputs, dim=0))
+                if attention_residual_match_input_rms:
+                    routed_input = match_rms_to_reference(routed_input, standard_residual_sum)
+
+                if capture_attention_residual_maps or capture_attention_residual_diagnostics:
+                    # Reproduce the operator's exact post-softmax probabilities
+                    # under no_grad and reduce them immediately for logging.
+                    with torch.no_grad():
+                        residual_sources = torch.stack(
+                            [source.detach() for source in source_outputs],
+                            dim=0,
+                        )
+                        source_keys = operator.key_norm(residual_sources.detach())
+                        source_scores = torch.einsum(
+                            "d, n b t d -> n b t",
+                            operator.pseudo_query.detach(),
+                            source_keys,
+                        )
+                        source_weights = torch.softmax(source_scores, dim=0)
+                        source_weights_float = source_weights.float()
+                        self.last_attention_residual_route_names.append(route_name)
+                        if capture_attention_residual_maps:
+                            selected_tokens = None
+                            if attention_residual_diagnostic_masked_tokens is not None:
+                                selected_tokens = attention_residual_diagnostic_masked_tokens.bool()
+                            if attention_residual_diagnostic_visible_tokens is not None:
+                                visible_tokens = attention_residual_diagnostic_visible_tokens.bool()
+                                selected_tokens = (
+                                    visible_tokens
+                                    if selected_tokens is None
+                                    else selected_tokens | visible_tokens
+                                )
+                            if selected_tokens is not None and selected_tokens.any():
+                                all_weights = source_weights_float.permute(1, 2, 0)[
+                                    selected_tokens
+                                ].mean(dim=0)
+                            else:
+                                all_weights = source_weights_float.mean(dim=(1, 2))
+                            self.last_attention_residual_maps.append(all_weights.cpu())
+                            if attention_residual_diagnostic_masked_tokens is not None:
+                                masked_tokens = attention_residual_diagnostic_masked_tokens.bool()
+                                if masked_tokens.any():
+                                    self.last_attention_residual_masked_maps.append(
+                                        source_weights_float.permute(1, 2, 0)[masked_tokens]
+                                        .mean(dim=0)
+                                        .cpu()
+                                    )
+                            if attention_residual_diagnostic_visible_tokens is not None:
+                                visible_tokens = attention_residual_diagnostic_visible_tokens.bool()
+                                if visible_tokens.any():
+                                    self.last_attention_residual_visible_maps.append(
+                                        source_weights_float.permute(1, 2, 0)[visible_tokens]
+                                        .mean(dim=0)
+                                        .cpu()
+                                    )
+                        if capture_attention_residual_diagnostics:
+                            source_count = source_weights.shape[0]
+                            entropy = -(
+                                source_weights_float.clamp_min(
+                                    torch.finfo(torch.float32).tiny
+                                ).log()
+                                * source_weights_float
+                            ).sum(dim=0).mean()
+                            entropy_normalized = (
+                                entropy / math.log(source_count)
+                                if source_count > 1
+                                else entropy.new_tensor(1.0)
+                            )
+                            delta = routed_input.detach() - standard_residual_sum.detach()
+                            self.last_attention_residual_diagnostics.append({
+                                "input_rms": standard_residual_sum.detach().float().square().mean().sqrt().item(),
+                                "output_rms": routed_input.detach().float().square().mean().sqrt().item(),
+                                "delta_rms": delta.float().square().mean().sqrt().item(),
+                                "pseudo_query_norm": operator.pseudo_query.detach().float().norm().item(),
+                                "source_logit_mean": source_scores.float().mean().item(),
+                                "source_logit_abs_max": source_scores.float().abs().max().item(),
+                                "source_attention_entropy": entropy.item(),
+                                "source_attention_entropy_normalized": entropy_normalized.item(),
+                                "source_attention_max_probability": source_weights.max(dim=0).values.mean().item(),
+                                "finite": float(
+                                    torch.isfinite(routed_input).all()
+                                    and torch.isfinite(source_scores).all()
+                                ),
+                            })
+
+                mixed_input = standard_residual_sum + attention_residual_scale * (
+                    routed_input - standard_residual_sum
+                )
+                if attention_residual_match_input_rms:
+                    mixed_input = match_rms_to_reference(mixed_input, standard_residual_sum)
+                return mixed_input
+
+            # Full AttnRes values are v_0 = embedding and the raw outputs of
+            # each Attention/MLP sub-layer. They are deliberately not the
+            # cumulative hidden states used by ordinary residual connections.
+            source_outputs = [x] if full_attnres_active else None
+            standard_residual_sum = x
             for block_idx, block in enumerate(self.transformer.blocks):
                 if output_hidden_states:
                     # add hidden states
-                    all_hidden_states.append(x)
+                    all_hidden_states.append(standard_residual_sum)
 
-                layer_input = x
+                layer_input = standard_residual_sum
                 layer_past = None if past_key_values is None else past_key_values[block_idx]
                 block_input = layer_input
-                if attention_residual_history is not None and attention_residual_scale > 0.0:
-                    residual_sources = torch.stack(attention_residual_history, dim=0)
-                    attention_residual_input = block.attn_res(residual_sources)
-                    if attention_residual_match_input_rms:
-                        attention_residual_input = match_rms_to_reference(
-                            attention_residual_input, layer_input
-                        )
-                    if capture_attention_residual_maps or capture_attention_residual_diagnostics:
-                        # Match AttnResOperator.forward, but do it under
-                        # no_grad and reduce immediately so logging never
-                        # retains the training graph or a full token-level map.
-                        with torch.no_grad():
-                            source_keys = block.attn_res.key_norm(residual_sources.detach())
-                            source_scores = torch.einsum(
-                                "d, n b t d -> n b t", block.attn_res.pseudo_query.detach(), source_keys
-                            )
-                            # Keep the same dtype and softmax operation as
-                            # AttnResOperator.forward so these are the actual
-                            # routing probabilities used by the model. Cast
-                            # only after softmax for stable reductions/logging.
-                            source_weights = torch.softmax(source_scores, dim=0)
-                            source_weights_float = source_weights.float()
-                            if capture_attention_residual_maps:
-                                selected_tokens = None
-                                if attention_residual_diagnostic_masked_tokens is not None:
-                                    selected_tokens = attention_residual_diagnostic_masked_tokens.bool()
-                                if attention_residual_diagnostic_visible_tokens is not None:
-                                    visible_tokens = attention_residual_diagnostic_visible_tokens.bool()
-                                    selected_tokens = (
-                                        visible_tokens if selected_tokens is None else selected_tokens | visible_tokens
-                                    )
-                                if selected_tokens is not None and selected_tokens.any():
-                                    all_weights = source_weights_float.permute(1, 2, 0)[selected_tokens].mean(dim=0)
-                                else:
-                                    all_weights = source_weights_float.mean(dim=(1, 2))
-                                self.last_attention_residual_maps.append(all_weights.cpu())
-                                if attention_residual_diagnostic_masked_tokens is not None:
-                                    masked_tokens = attention_residual_diagnostic_masked_tokens.bool()
-                                    if masked_tokens.any():
-                                        self.last_attention_residual_masked_maps.append(
-                                            source_weights_float.permute(1, 2, 0)[masked_tokens].mean(dim=0).cpu()
-                                        )
-                                if attention_residual_diagnostic_visible_tokens is not None:
-                                    visible_tokens = attention_residual_diagnostic_visible_tokens.bool()
-                                    if visible_tokens.any():
-                                        self.last_attention_residual_visible_maps.append(
-                                            source_weights_float.permute(1, 2, 0)[visible_tokens].mean(dim=0).cpu()
-                                        )
-                            if capture_attention_residual_diagnostics:
-                                source_count = source_weights.shape[0]
-                                entropy = -(
-                                    source_weights_float.clamp_min(torch.finfo(torch.float32).tiny).log()
-                                    * source_weights_float
-                                ).sum(dim=0).mean()
-                                entropy_normalized = (
-                                    entropy / math.log(source_count) if source_count > 1 else entropy.new_tensor(1.0)
-                                )
-                                delta = attention_residual_input.detach() - x.detach()
-                                self.last_attention_residual_diagnostics.append({
-                                    "input_rms": x.detach().float().square().mean().sqrt().item(),
-                                    "output_rms": attention_residual_input.detach().float().square().mean().sqrt().item(),
-                                    "delta_rms": delta.float().square().mean().sqrt().item(),
-                                    "pseudo_query_norm": block.attn_res.pseudo_query.detach().float().norm().item(),
-                                    "source_logit_mean": source_scores.float().mean().item(),
-                                    "source_logit_abs_max": source_scores.float().abs().max().item(),
-                                    "source_attention_entropy": entropy.item(),
-                                    "source_attention_entropy_normalized": entropy_normalized.item(),
-                                    "source_attention_max_probability": source_weights.max(dim=0).values.mean().item(),
-                                    "finite": float(
-                                        torch.isfinite(attention_residual_input).all()
-                                        and torch.isfinite(source_scores).all()
-                                    ),
-                                })
-                    block_input = layer_input + attention_residual_scale * (attention_residual_input - layer_input)
-                    if attention_residual_match_input_rms:
-                        # Equal RMS for both endpoints does not guarantee equal
-                        # RMS after interpolation, since their directions may
-                        # differ. Constrain the actual transformer input too.
-                        block_input = match_rms_to_reference(block_input, layer_input)
-                if (
-                    (self.activation_checkpointing_strategy == ActivationCheckpointingStrategy.whole_layer)
-                    or (
-                        self.activation_checkpointing_strategy == ActivationCheckpointingStrategy.one_in_two
-                        and block_idx % 2 == 0
+                if full_attnres_active:
+                    assert source_outputs is not None
+                    block_input = route_full_attention_residual(
+                        block.attn_res_attention,
+                        source_outputs,
+                        standard_residual_sum,
+                        f"block_{block_idx:02d}_attention",
                     )
-                    or (
-                        self.activation_checkpointing_strategy == ActivationCheckpointingStrategy.one_in_three
-                        and block_idx % 3 == 0
-                    )
-                    or (
-                        self.activation_checkpointing_strategy == ActivationCheckpointingStrategy.one_in_four
-                        and block_idx % 4 == 0
-                    )
-                ):
-                    # shape: (batch_size, seq_len, d_model)
-                    x, cache = self._activation_checkpoint_fn(
-                        block, block_input, attention_bias=attention_bias, layer_past=layer_past, use_cache=use_cache
-                    )
-                else:
-                    # shape: (batch_size, seq_len, d_model)
-                    x, cache = block(
+                    attention_output, cache = block.forward_attention_sublayer(
                         block_input,
                         attention_bias=attention_bias,
-                        layer_past=layer_past, 
+                        layer_past=layer_past,
                         use_cache=use_cache,
                     )
+                    source_outputs.append(attention_output)
+                    standard_residual_sum = standard_residual_sum + attention_output
+
+                    mlp_input = route_full_attention_residual(
+                        block.attn_res_mlp,
+                        source_outputs,
+                        standard_residual_sum,
+                        f"block_{block_idx:02d}_mlp",
+                    )
+                    mlp_output = block.forward_mlp_sublayer(mlp_input)
+                    source_outputs.append(mlp_output)
+                    standard_residual_sum = standard_residual_sum + mlp_output
+                    x = standard_residual_sum
+                else:
+                    if (
+                        (self.activation_checkpointing_strategy == ActivationCheckpointingStrategy.whole_layer)
+                        or (
+                            self.activation_checkpointing_strategy == ActivationCheckpointingStrategy.one_in_two
+                            and block_idx % 2 == 0
+                        )
+                        or (
+                            self.activation_checkpointing_strategy == ActivationCheckpointingStrategy.one_in_three
+                            and block_idx % 3 == 0
+                        )
+                        or (
+                            self.activation_checkpointing_strategy == ActivationCheckpointingStrategy.one_in_four
+                            and block_idx % 4 == 0
+                        )
+                    ):
+                        x, cache = self._activation_checkpoint_fn(
+                            block,
+                            block_input,
+                            attention_bias=attention_bias,
+                            layer_past=layer_past,
+                            use_cache=use_cache,
+                        )
+                    else:
+                        x, cache = block(
+                            block_input,
+                            attention_bias=attention_bias,
+                            layer_past=layer_past,
+                            use_cache=use_cache,
+                        )
+                    standard_residual_sum = x
                 if capture_layer_diagnostics:
                     with torch.no_grad():
                         input_value = layer_input.detach()
@@ -1480,11 +1593,18 @@ class LLaDAModel(nn.Module):
                                 torch.isfinite(block_input_value).all() and torch.isfinite(x).all()
                             ),
                         })
-                if attention_residual_history is not None:
-                    attention_residual_history.append(x)
                 if attn_key_values is not None:
                     assert cache is not None
                     attn_key_values.append(cache)
+
+            if full_attnres_active:
+                assert source_outputs is not None
+                x = route_full_attention_residual(
+                    self.output_attn_res,
+                    source_outputs,
+                    standard_residual_sum,
+                    "output",
+                )
         else:
             for group_idx, block_group in enumerate(self.transformer.block_groups):
                 if output_hidden_states:
