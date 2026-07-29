@@ -90,6 +90,84 @@ def attention_residual_image(source_maps, num_layers):
     )
 
 
+def attention_residual_raw_image(source_maps, num_layers, scale_max=1.0, caption_prefix=""):
+    """Render raw post-softmax routing weights with a fixed cross-step scale.
+
+    Blue is zero and red is ``scale_max``. Unlike
+    :func:`attention_residual_image`, values are not centered on the uniform
+    distribution and the image is never normalized using its own extrema.
+    """
+    if scale_max <= 0.0:
+        raise ValueError("raw routing heatmap scale_max must be positive")
+    routing = np.zeros((num_layers, num_layers), dtype=np.float32)
+    valid = np.zeros((num_layers, num_layers), dtype=bool)
+    for block_idx, weights in enumerate(source_maps):
+        count = weights.numel()
+        routing[block_idx, :count] = weights.numpy()
+        valid[block_idx, :count] = True
+
+    normalized = np.clip(routing / scale_max, 0.0, 1.0)
+    rgb = np.full((num_layers, num_layers, 3), 36, dtype=np.uint8)
+    values = normalized[valid]
+    # Fixed blue -> cyan/yellow -> red palette.
+    rgb[..., 0][valid] = (255 * np.clip(2.0 * values - 0.5, 0.0, 1.0)).astype(np.uint8)
+    rgb[..., 1][valid] = (255 * np.clip(1.5 - np.abs(2.0 * values - 1.0), 0.0, 1.0)).astype(np.uint8)
+    rgb[..., 2][valid] = (255 * np.clip(1.0 - 2.0 * values, 0.0, 1.0)).astype(np.uint8)
+    prefix = f"{caption_prefix}; " if caption_prefix else ""
+    return wandb.Image(
+        rgb,
+        caption=(
+            f"{prefix}raw post-softmax routing weights; fixed scale [0, {scale_max:g}]; "
+            "row=target block, column=source depth"
+        ),
+    )
+
+
+def average_source_maps(map_sets, example_weights=None):
+    """Average matching triangular maps, optionally weighting by token count."""
+    if not map_sets:
+        return []
+    layer_count = len(map_sets[0])
+    if any(len(maps) != layer_count for maps in map_sets):
+        raise ValueError("held-out routing map layer counts do not match")
+    if example_weights is None:
+        weights = torch.ones(len(map_sets), dtype=torch.float32)
+    else:
+        weights = torch.as_tensor(example_weights, dtype=torch.float32)
+        if weights.numel() != len(map_sets) or (weights <= 0).any():
+            raise ValueError("held-out routing map weights must be positive and match map sets")
+    weights = weights / weights.sum()
+    return [
+        torch.stack([maps[layer_idx] for maps in map_sets]).mul(
+            weights[:, None]
+        ).sum(dim=0)
+        for layer_idx in range(layer_count)
+    ]
+
+
+def routing_summary_metrics(source_maps, prefix):
+    """Compact numerical summaries complementing the per-layer heatmap."""
+    if not source_maps:
+        return {}
+    latest_weights = torch.stack([weights[-1].float() for weights in source_maps])
+    peak_weights = torch.stack([weights.float().max() for weights in source_maps])
+    normalized_entropies = []
+    for weights in source_maps:
+        probabilities = weights.float().clamp_min(torch.finfo(torch.float32).tiny)
+        if probabilities.numel() == 1:
+            normalized_entropies.append(probabilities.new_tensor(1.0))
+        else:
+            entropy = -(probabilities * probabilities.log()).sum()
+            normalized_entropies.append(entropy / math.log(probabilities.numel()))
+    return {
+        f"{prefix}/latest_source_weight_mean": latest_weights.mean().item(),
+        f"{prefix}/latest_source_weight_min": latest_weights.min().item(),
+        f"{prefix}/latest_source_weight_max": latest_weights.max().item(),
+        f"{prefix}/peak_source_weight_mean": peak_weights.mean().item(),
+        f"{prefix}/normalized_entropy_mean": torch.stack(normalized_entropies).mean().item(),
+    }
+
+
 def document_token_batch(iterator, tokenizer, batch_size, sequence_length):
     """Return independent documents padded/truncated to a fixed sequence length.
 
@@ -105,6 +183,131 @@ def document_token_batch(iterator, tokenizer, batch_size, sequence_length):
         padding="max_length",
         return_tensors="pt",
     )
+
+
+def heldout_token_batches(dataset, tokenizer, sequence_length, eval_cfg):
+    """Materialize deterministic documents reserved outside the training stream."""
+    iterator = iter(dataset)
+    batches = []
+    target_examples = int(eval_cfg.get("num_examples", 4))
+    while len(batches) < target_examples:
+        batch = tokenizer(
+            next(iterator)["text"],
+            truncation=True,
+            max_length=sequence_length,
+            padding="max_length",
+            return_tensors="pt",
+        )
+        if batch["attention_mask"].sum().item() >= 2:
+            batches.append(batch)
+    return batches
+
+
+def fixed_ratio_mask(valid_tokens, ratio, seed):
+    """Choose an exact, deterministic masked subset of the valid token positions."""
+    valid_positions = valid_tokens.nonzero(as_tuple=False)
+    valid_count = valid_positions.shape[0]
+    if valid_count < 2:
+        raise ValueError("held-out routing examples need at least two valid tokens")
+    masked_count = min(max(1, round(valid_count * ratio)), valid_count - 1)
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(seed)
+    selected = valid_positions[torch.randperm(valid_count, generator=generator)[:masked_count]]
+    masked = torch.zeros_like(valid_tokens, dtype=torch.bool)
+    masked[selected[:, 0], selected[:, 1]] = True
+    return masked
+
+
+@torch.no_grad()
+def heldout_routing_metrics(
+    model,
+    heldout_batches,
+    mask_ratios,
+    mask_token_id,
+    device,
+    attention_residual_scale,
+    match_input_rms,
+    raw_scale_max,
+    seed,
+):
+    """Evaluate raw routing maps on fixed text and masks without touching DDP state."""
+    module = model.module
+    was_training = module.training
+    module.eval()
+    metrics = {}
+    try:
+        for ratio_idx, ratio in enumerate(mask_ratios):
+            masked_map_sets = []
+            visible_map_sets = []
+            all_map_sets = []
+            masked_token_counts = []
+            visible_token_counts = []
+            all_token_counts = []
+            for example_idx, batch in enumerate(heldout_batches):
+                ids = batch["input_ids"].to(device)
+                attention_mask = batch["attention_mask"].to(device)
+                valid_tokens_cpu = batch["attention_mask"].bool()
+                masked_cpu = fixed_ratio_mask(
+                    valid_tokens_cpu,
+                    ratio,
+                    seed + ratio_idx * 100_000 + example_idx,
+                )
+                masked = masked_cpu.to(device)
+                visible = attention_mask.bool() & ~masked
+                corrupted = ids.masked_fill(masked, mask_token_id)
+                with torch.autocast("cuda", dtype=torch.bfloat16):
+                    module(
+                        input_ids=corrupted,
+                        attention_mask=attention_mask,
+                        use_attention_residuals=True,
+                        attention_residual_scale=attention_residual_scale,
+                        attention_residual_match_input_rms=match_input_rms,
+                        capture_attention_residual_maps=True,
+                        attention_residual_diagnostic_masked_tokens=masked,
+                        attention_residual_diagnostic_visible_tokens=visible,
+                    )
+                all_map_sets.append(module.model.last_attention_residual_maps)
+                masked_map_sets.append(module.model.last_attention_residual_masked_maps)
+                visible_map_sets.append(module.model.last_attention_residual_visible_maps)
+                masked_token_counts.append(masked.sum().item())
+                visible_token_counts.append(visible.sum().item())
+                all_token_counts.append(attention_mask.sum().item())
+
+            ratio_name = f"{ratio:.2f}"
+            num_layers = module.config.n_layers
+            averaged_maps = {
+                "all": average_source_maps(all_map_sets, all_token_counts),
+                "masked": average_source_maps(masked_map_sets, masked_token_counts),
+                "visible": average_source_maps(visible_map_sets, visible_token_counts),
+            }
+            metrics[f"attn_res/heldout/mask_{ratio_name}/all/raw_weights"] = attention_residual_raw_image(
+                averaged_maps["all"],
+                num_layers,
+                raw_scale_max,
+                caption_prefix=f"held-out mask ratio={ratio_name}, all valid tokens",
+            )
+            metrics[f"attn_res/heldout/mask_{ratio_name}/masked/raw_weights"] = attention_residual_raw_image(
+                averaged_maps["masked"],
+                num_layers,
+                raw_scale_max,
+                caption_prefix=f"held-out mask ratio={ratio_name}, masked tokens",
+            )
+            metrics[f"attn_res/heldout/mask_{ratio_name}/visible/raw_weights"] = attention_residual_raw_image(
+                averaged_maps["visible"],
+                num_layers,
+                raw_scale_max,
+                caption_prefix=f"held-out mask ratio={ratio_name}, visible tokens",
+            )
+            for token_group, maps in averaged_maps.items():
+                metrics.update(
+                    routing_summary_metrics(
+                        maps,
+                        f"attn_res/heldout/mask_{ratio_name}/{token_group}",
+                    )
+                )
+    finally:
+        module.train(was_training)
+    return metrics
 
 
 def main():
@@ -231,13 +434,45 @@ def main():
         raise ValueError(f"Unsupported scheduler: {scheduler_name}")
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, factor)
 
-    dataset = load_dataset(
+    full_dataset = load_dataset(
         data_cfg["dataset"],
         name=data_cfg.get("subset"),
         split=data_cfg["split"],
         streaming=True,
-    ).shard(world, rank)
+    )
+    routing_eval_cfg = cfg["logging"].get("heldout_routing_evaluation", {})
+    routing_eval_enabled = bool(routing_eval_cfg.get("enabled", False))
+    routing_eval_every = int(routing_eval_cfg.get("every_steps", 20))
+    routing_eval_ratios = [float(value) for value in routing_eval_cfg.get("mask_ratios", [0.1, 0.5, 0.9])]
+    routing_raw_scale_max = float(routing_eval_cfg.get("raw_weight_scale_max", 1.0))
+    routing_num_examples = int(routing_eval_cfg.get("num_examples", 4))
+    routing_reserved_documents = int(routing_eval_cfg.get("reserved_documents", 32))
+    if routing_eval_enabled:
+        if routing_eval_every < 1:
+            raise ValueError("logging.heldout_routing_evaluation.every_steps must be positive")
+        if not routing_eval_ratios or any(not 0.0 < ratio < 1.0 for ratio in routing_eval_ratios):
+            raise ValueError("held-out routing mask_ratios must contain values in (0, 1)")
+        if routing_raw_scale_max <= 0.0:
+            raise ValueError("held-out raw_weight_scale_max must be positive")
+        if routing_num_examples < 1:
+            raise ValueError("held-out num_examples must be positive")
+        if routing_reserved_documents < routing_num_examples:
+            raise ValueError("held-out reserved_documents must be >= num_examples")
+    heldout_batches = (
+        heldout_token_batches(
+            full_dataset.take(routing_reserved_documents),
+            tokenizer,
+            model_cfg["context_length"],
+            routing_eval_cfg,
+        )
+        if rank == 0 and routing_eval_enabled else []
+    )
+    # The same prefix is skipped on every rank, so none of the fixed routing
+    # examples can later leak into optimization.
+    dataset = full_dataset.skip(routing_reserved_documents if routing_eval_enabled else 0).shard(world, rank)
     iterator = iter(dataset)
+    if world > 1:
+        dist.barrier()
     if rank == 0:
         run = wandb.init(entity=cfg["logging"]["wandb_entity"], project=cfg["logging"]["wandb_project"], name=cfg["run_name"], config=cfg, settings=wandb.Settings(base_url=cfg["logging"]["wandb_base_url"]))
         # Keep the exact input file in the run, not only its parsed key/value
@@ -322,6 +557,10 @@ def main():
                     attention_residual_match_input_rms=cfg["attention_residuals"].get("match_input_rms", False),
                     capture_attention_residual_maps=capture_attention_maps,
                     capture_attention_residual_diagnostics=capture_attention_residual_diagnostics,
+                    attention_residual_diagnostic_masked_tokens=masked if capture_attention_maps else None,
+                    attention_residual_diagnostic_visible_tokens=(
+                        valid_tokens & ~masked if capture_attention_maps else None
+                    ),
                     capture_layer_diagnostics=capture_layer_diagnostics,
                 ).logits
                 token_loss = F.cross_entropy(logits[masked], ids[masked], reduction="none")
@@ -335,6 +574,22 @@ def main():
             mask_probability_sum += p_mask.mean().item()
             masked_fraction_sum += (masked.sum() / valid_tokens.sum()).item()
             processed += valid_tokens.sum().item() * world
+        training_attention_maps = (
+            list(model.module.model.last_attention_residual_maps) if capture_attention_maps else []
+        )
+        training_masked_maps = (
+            list(model.module.model.last_attention_residual_masked_maps) if capture_attention_maps else []
+        )
+        training_visible_maps = (
+            list(model.module.model.last_attention_residual_visible_maps) if capture_attention_maps else []
+        )
+        training_attention_diagnostics = (
+            list(model.module.model.last_attention_residual_diagnostics)
+            if capture_attention_residual_diagnostics else []
+        )
+        training_layer_diagnostics = (
+            list(model.module.model.last_layer_diagnostics) if capture_layer_diagnostics else []
+        )
         attn_grad_pre_clip, base_grad_pre_clip = norm(attn_params), norm(base_params)
         layer_gradients_pre_clip = (
             attention_residual_layer_metrics(model.module, include_gradients=True)
@@ -358,6 +613,25 @@ def main():
             # In AR-only training, scale=0 initially leaves all trainable AR
             # parameters outside the graph, so there is no optimizer step.
             scheduler.step()
+        heldout_metrics = {}
+        if (
+            rank == 0
+            and routing_eval_enabled
+            and cfg["attention_residuals"]["enabled"]
+            and ar_scale > 0.0
+            and step % routing_eval_every == 0
+        ):
+            heldout_metrics = heldout_routing_metrics(
+                model=model,
+                heldout_batches=heldout_batches,
+                mask_ratios=routing_eval_ratios,
+                mask_token_id=mask_id,
+                device=device,
+                attention_residual_scale=ar_scale,
+                match_input_rms=cfg["attention_residuals"].get("match_input_rms", False),
+                raw_scale_max=routing_raw_scale_max,
+                seed=int(routing_eval_cfg.get("seed", cfg["seed"] + 10_000)),
+            )
         if rank == 0 and step % cfg["logging"]["log_every_steps"] == 0:
             metrics = {
                 "train/loss": loss_sum,
@@ -377,11 +651,35 @@ def main():
             }
             if capture_attention_maps:
                 metrics["attn_res/source_attention"] = attention_residual_image(
-                    model.module.model.last_attention_residual_maps,
+                    training_attention_maps,
                     model.module.config.n_layers,
                 )
+                metrics["attn_res/train/all/raw_weights"] = attention_residual_raw_image(
+                    training_attention_maps,
+                    model.module.config.n_layers,
+                    routing_raw_scale_max,
+                    caption_prefix="training batch, all valid tokens",
+                )
+                metrics["attn_res/train/masked/raw_weights"] = attention_residual_raw_image(
+                    training_masked_maps,
+                    model.module.config.n_layers,
+                    routing_raw_scale_max,
+                    caption_prefix="training batch, masked tokens",
+                )
+                metrics["attn_res/train/visible/raw_weights"] = attention_residual_raw_image(
+                    training_visible_maps,
+                    model.module.config.n_layers,
+                    routing_raw_scale_max,
+                    caption_prefix="training batch, visible tokens",
+                )
+                for token_group, maps in {
+                    "all": training_attention_maps,
+                    "masked": training_masked_maps,
+                    "visible": training_visible_maps,
+                }.items():
+                    metrics.update(routing_summary_metrics(maps, f"attn_res/train/{token_group}"))
             if capture_attention_residual_diagnostics:
-                for layer_idx, values in enumerate(model.module.model.last_attention_residual_diagnostics):
+                for layer_idx, values in enumerate(training_attention_diagnostics):
                     metrics.update({f"attn_res/layer_{layer_idx:02d}/{name}": value for name, value in values.items()})
                 metrics.update(layer_gradients_pre_clip)
                 layer_gradients_post_clip = attention_residual_layer_metrics(
@@ -391,11 +689,12 @@ def main():
                     if name.endswith("_grad_norm"):
                         metrics[f"{name}_post_clip"] = value
             if capture_layer_diagnostics:
-                for layer_idx, values in enumerate(model.module.model.last_layer_diagnostics):
+                for layer_idx, values in enumerate(training_layer_diagnostics):
                     metrics.update({f"transformer/layer_{layer_idx:02d}/{name}": value for name, value in values.items()})
                 metrics.update({f"{name}_pre_clip": value for name, value in transformer_gradients_pre_clip.items()})
                 transformer_gradients_post_clip = transformer_layer_gradient_metrics(model.module)
                 metrics.update({f"{name}_post_clip": value for name, value in transformer_gradients_post_clip.items()})
+            metrics.update(heldout_metrics)
             run.log(metrics, step=step)
             progress_bar.set_postfix(loss=f"{loss_sum:.4f}", lr=f"{metrics['train/lr_base']:.2e}/{metrics['train/lr_attention_residuals']:.2e}", ar=f"{ar_scale:.3f}")
             if step % 10 == 0:

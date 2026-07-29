@@ -1220,6 +1220,8 @@ class LLaDAModel(nn.Module):
         attention_residual_match_input_rms: bool = False,
         capture_attention_residual_maps: bool = False,
         capture_attention_residual_diagnostics: bool = False,
+        attention_residual_diagnostic_masked_tokens: Optional[torch.Tensor] = None,
+        attention_residual_diagnostic_visible_tokens: Optional[torch.Tensor] = None,
         capture_layer_diagnostics: bool = False,
     ) -> LLaDAOutput:
         """
@@ -1341,6 +1343,8 @@ class LLaDAModel(nn.Module):
         # retain only its batch/token average for each target block.  Keeping
         # the full [sources, batch, tokens] tensor would be prohibitively large.
         self.last_attention_residual_maps = []
+        self.last_attention_residual_masked_maps = []
+        self.last_attention_residual_visible_maps = []
         self.last_attention_residual_diagnostics = []
         self.last_layer_diagnostics = []
 
@@ -1372,16 +1376,43 @@ class LLaDAModel(nn.Module):
                             source_scores = torch.einsum(
                                 "d, n b t d -> n b t", block.attn_res.pseudo_query.detach(), source_keys
                             )
-                            source_weights = torch.softmax(source_scores.float(), dim=0)
+                            # Keep the same dtype and softmax operation as
+                            # AttnResOperator.forward so these are the actual
+                            # routing probabilities used by the model. Cast
+                            # only after softmax for stable reductions/logging.
+                            source_weights = torch.softmax(source_scores, dim=0)
+                            source_weights_float = source_weights.float()
                             if capture_attention_residual_maps:
-                                self.last_attention_residual_maps.append(
-                                    source_weights.mean(dim=(1, 2)).cpu()
-                                )
+                                selected_tokens = None
+                                if attention_residual_diagnostic_masked_tokens is not None:
+                                    selected_tokens = attention_residual_diagnostic_masked_tokens.bool()
+                                if attention_residual_diagnostic_visible_tokens is not None:
+                                    visible_tokens = attention_residual_diagnostic_visible_tokens.bool()
+                                    selected_tokens = (
+                                        visible_tokens if selected_tokens is None else selected_tokens | visible_tokens
+                                    )
+                                if selected_tokens is not None and selected_tokens.any():
+                                    all_weights = source_weights_float.permute(1, 2, 0)[selected_tokens].mean(dim=0)
+                                else:
+                                    all_weights = source_weights_float.mean(dim=(1, 2))
+                                self.last_attention_residual_maps.append(all_weights.cpu())
+                                if attention_residual_diagnostic_masked_tokens is not None:
+                                    masked_tokens = attention_residual_diagnostic_masked_tokens.bool()
+                                    if masked_tokens.any():
+                                        self.last_attention_residual_masked_maps.append(
+                                            source_weights_float.permute(1, 2, 0)[masked_tokens].mean(dim=0).cpu()
+                                        )
+                                if attention_residual_diagnostic_visible_tokens is not None:
+                                    visible_tokens = attention_residual_diagnostic_visible_tokens.bool()
+                                    if visible_tokens.any():
+                                        self.last_attention_residual_visible_maps.append(
+                                            source_weights_float.permute(1, 2, 0)[visible_tokens].mean(dim=0).cpu()
+                                        )
                             if capture_attention_residual_diagnostics:
                                 source_count = source_weights.shape[0]
                                 entropy = -(
-                                    source_weights.clamp_min(torch.finfo(source_weights.dtype).tiny).log()
-                                    * source_weights
+                                    source_weights_float.clamp_min(torch.finfo(torch.float32).tiny).log()
+                                    * source_weights_float
                                 ).sum(dim=0).mean()
                                 entropy_normalized = (
                                     entropy / math.log(source_count) if source_count > 1 else entropy.new_tensor(1.0)
@@ -1548,6 +1579,8 @@ class LLaDAModelLM(PreTrainedModel):
         attention_residual_match_input_rms: bool = False,
         capture_attention_residual_maps: bool = False,
         capture_attention_residual_diagnostics: bool = False,
+        attention_residual_diagnostic_masked_tokens: Optional[torch.Tensor] = None,
+        attention_residual_diagnostic_visible_tokens: Optional[torch.Tensor] = None,
         capture_layer_diagnostics: bool = False,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         if use_cache is None:
@@ -1572,6 +1605,8 @@ class LLaDAModelLM(PreTrainedModel):
             attention_residual_match_input_rms=attention_residual_match_input_rms,
             capture_attention_residual_maps=capture_attention_residual_maps,
             capture_attention_residual_diagnostics=capture_attention_residual_diagnostics,
+            attention_residual_diagnostic_masked_tokens=attention_residual_diagnostic_masked_tokens,
+            attention_residual_diagnostic_visible_tokens=attention_residual_diagnostic_visible_tokens,
             capture_layer_diagnostics=capture_layer_diagnostics,
         )
 
