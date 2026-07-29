@@ -1,6 +1,6 @@
 {
   "run_name": "llada8b-fineweb-full-attn-res-only-sft-schedule",
-  "git_commit": "daf3e27a99e3dd10464cd7c08d4c9b005b29002d",
+  "git_commit": null,
   "seed": 42,
   "model": {
     "checkpoint": "/extra_disk_1/vasilievpavel/dlm-attn-res/huggingface/hub/models--GSAI-ML--LLaDA-8B-Base/snapshots/0f2787f2d87eac5eed8a087d5ecd24277e6255b2",
@@ -42,6 +42,7 @@
   "attention_residuals": {
     "enabled": true,
     "warmup_steps": 300,
+    "match_input_rms": true,
     "scale_schedule": "linear_0_to_1"
   },
   "distributed": {
@@ -57,6 +58,15 @@
     "attention_residual_diagnostics": {
       "enabled": true,
       "every_steps": 20
+    },
+    "heldout_routing_evaluation": {
+      "enabled": true,
+      "every_steps": 20,
+      "num_examples": 4,
+      "mask_ratios": [0.1, 0.5, 0.9],
+      "raw_weight_scale_max": 1.0,
+      "seed": 10042,
+      "reserved_documents": 32
     },
     "checkpoint_every_steps": 500,
     "output_dir": "/extra_disk_1/vasilievpavel/dlm-attn-res/runs"

@@ -1,5 +1,5 @@
 {
-  "run_name": "llada8b-fineweb-full-attn-res-and-base-sft-schedule",
+  "run_name": "llada8b-fineweb-full-attn-res-and-base-rms-matched",
   "git_commit": "fb9c0fc48c08bad5c47a03ae1e4349a0649d96e9",
   "seed": 42,
   "model": {
@@ -46,7 +46,7 @@
     "scale_schedule": "linear_0_to_1"
   },
   "distributed": {
-    "cuda_visible_devices": "3",
+    "cuda_visible_devices": "1",
     "world_size": 1
   },
   "logging": {
