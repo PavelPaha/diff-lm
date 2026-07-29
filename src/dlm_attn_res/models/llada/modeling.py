@@ -44,18 +44,6 @@ from .configuration import (
 
 from attn_res import AttnResOperator
 
-
-def match_rms_to_reference(value: torch.Tensor, reference: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
-    """Rescale each token in ``value`` to the RMS of its reference token.
-
-    The scale factors are detached: this is a forward-scale constraint for a
-    pretrained residual stream, not another path through which to optimize
-    vector magnitudes.
-    """
-    value_rms = value.detach().float().square().mean(dim=-1, keepdim=True).add(eps).sqrt()
-    reference_rms = reference.detach().float().square().mean(dim=-1, keepdim=True).add(eps).sqrt()
-    return value * (reference_rms / value_rms).to(dtype=value.dtype)
-
 if sys.version_info.minor > 8:
     from collections.abc import MutableMapping
 elif sys.version_info.minor == 8:
@@ -1245,7 +1233,6 @@ class LLaDAModel(nn.Module):
         output_hidden_states: Optional[bool] = None,
         use_attention_residuals: bool = False,
         attention_residual_scale: float = 0.0,
-        attention_residual_match_input_rms: bool = False,
         capture_attention_residual_maps: bool = False,
         capture_attention_residual_diagnostics: bool = False,
         attention_residual_diagnostic_masked_tokens: Optional[torch.Tensor] = None,
@@ -1417,9 +1404,6 @@ class LLaDAModel(nn.Module):
                     )
                 else:
                     routed_input = operator(torch.stack(source_outputs, dim=0))
-                if attention_residual_match_input_rms:
-                    routed_input = match_rms_to_reference(routed_input, standard_residual_sum)
-
                 if capture_attention_residual_maps or capture_attention_residual_diagnostics:
                     # Reproduce the operator's exact post-softmax probabilities
                     # under no_grad and reduce them immediately for logging.
@@ -1504,8 +1488,6 @@ class LLaDAModel(nn.Module):
                 mixed_input = standard_residual_sum + attention_residual_scale * (
                     routed_input - standard_residual_sum
                 )
-                if attention_residual_match_input_rms:
-                    mixed_input = match_rms_to_reference(mixed_input, standard_residual_sum)
                 return mixed_input
 
             # Full AttnRes values are v_0 = embedding and the raw outputs of
@@ -1696,7 +1678,6 @@ class LLaDAModelLM(PreTrainedModel):
         cache_position: Optional[Cache] = None,  # This is a hack mitigation of an issue in transformers `4.39.x`
         use_attention_residuals: bool = False,
         attention_residual_scale: float = 0.0,
-        attention_residual_match_input_rms: bool = False,
         capture_attention_residual_maps: bool = False,
         capture_attention_residual_diagnostics: bool = False,
         attention_residual_diagnostic_masked_tokens: Optional[torch.Tensor] = None,
@@ -1722,7 +1703,6 @@ class LLaDAModelLM(PreTrainedModel):
             output_hidden_states=output_hidden_states,
             use_attention_residuals=use_attention_residuals,
             attention_residual_scale=attention_residual_scale,
-            attention_residual_match_input_rms=attention_residual_match_input_rms,
             capture_attention_residual_maps=capture_attention_residual_maps,
             capture_attention_residual_diagnostics=capture_attention_residual_diagnostics,
             attention_residual_diagnostic_masked_tokens=attention_residual_diagnostic_masked_tokens,

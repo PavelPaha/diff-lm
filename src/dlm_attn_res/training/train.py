@@ -234,7 +234,6 @@ def heldout_routing_metrics(
     mask_token_id,
     device,
     attention_residual_scale,
-    match_input_rms,
     raw_scale_max,
     seed,
 ):
@@ -269,7 +268,6 @@ def heldout_routing_metrics(
                         attention_mask=attention_mask,
                         use_attention_residuals=True,
                         attention_residual_scale=attention_residual_scale,
-                        attention_residual_match_input_rms=match_input_rms,
                         capture_attention_residual_maps=True,
                         attention_residual_diagnostic_masked_tokens=masked,
                         attention_residual_diagnostic_visible_tokens=visible,
@@ -565,7 +563,6 @@ def main():
                     attention_mask=attention_mask,
                     use_attention_residuals=cfg["attention_residuals"]["enabled"],
                     attention_residual_scale=ar_scale,
-                    attention_residual_match_input_rms=cfg["attention_residuals"].get("match_input_rms", False),
                     capture_attention_residual_maps=capture_attention_maps,
                     capture_attention_residual_diagnostics=capture_attention_residual_diagnostics,
                     attention_residual_diagnostic_masked_tokens=masked if capture_attention_maps else None,
@@ -643,7 +640,6 @@ def main():
                 mask_token_id=mask_id,
                 device=device,
                 attention_residual_scale=ar_scale,
-                match_input_rms=cfg["attention_residuals"].get("match_input_rms", False),
                 raw_scale_max=routing_raw_scale_max,
                 seed=int(routing_eval_cfg.get("seed", cfg["seed"] + 10_000)),
             )

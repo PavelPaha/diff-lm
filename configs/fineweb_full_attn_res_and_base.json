@@ -43,7 +43,6 @@
     "enabled": true,
     "mode": "full",
     "warmup_steps": 300,
-    "match_input_rms": false,
     "scale_schedule": "linear_0_to_1"
   },
   "distributed": {

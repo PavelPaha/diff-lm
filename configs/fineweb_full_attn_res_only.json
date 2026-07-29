@@ -42,7 +42,6 @@
   "attention_residuals": {
     "enabled": true,
     "warmup_steps": 300,
-    "match_input_rms": true,
     "scale_schedule": "linear_0_to_1"
   },
   "distributed": {
