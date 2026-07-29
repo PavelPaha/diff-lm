@@ -1,6 +1,6 @@
 {
-  "run_name": "llada8b-fineweb-full-attn-res-and-base-no-rms-match",
-  "git_commit": "fb9c0fc48c08bad5c47a03ae1e4349a0649d96e9",
+  "run_name": "llada8b-fineweb-paper-full-attn-res-and-base",
+  "git_commit": "7d981b49f96c854177df7d3b6eae4aae243eb7a2",
   "seed": 42,
   "model": {
     "checkpoint": "/extra_disk_1/vasilievpavel/dlm-attn-res/huggingface/hub/models--GSAI-ML--LLaDA-8B-Base/snapshots/0f2787f2d87eac5eed8a087d5ecd24277e6255b2",
@@ -41,6 +41,7 @@
   },
   "attention_residuals": {
     "enabled": true,
+    "mode": "full",
     "warmup_steps": 300,
     "match_input_rms": false,
     "scale_schedule": "linear_0_to_1"
