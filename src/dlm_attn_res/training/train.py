@@ -19,6 +19,11 @@ from tqdm.auto import tqdm
 
 from dlm_attn_res.models.llada import LLaDAConfig, LLaDAModelLM
 from dlm_attn_res.models.llada.configuration import ActivationCheckpointingStrategy
+from dlm_attn_res.training.data import (
+    heldout_token_batches,
+    repeat_dataset,
+    token_batch,
+)
 
 
 def norm(parameters):
@@ -28,6 +33,20 @@ def norm(parameters):
 
 def parameter_norm(parameter):
     return parameter.detach().float().norm().item()
+
+
+def masked_diffusion_loss(logits, targets, masked, p_mask, target_tokens, objective):
+    """Compute the Rao-Blackwellized diffusion loss on selected target tokens."""
+    token_loss = F.cross_entropy(logits[masked], targets[masked], reduction="none")
+    token_loss = token_loss / p_mask[:, None].expand_as(targets)[masked]
+    if objective == "sft_response_only":
+        # Algorithm 2-style conditional diffusion SFT: the prompt is always
+        # visible and each response contributes equal total weight,
+        # independent of its length.
+        response_lengths = target_tokens.sum(dim=-1, keepdim=True)
+        per_token_denominator = response_lengths.expand_as(targets)[masked]
+        return (token_loss / per_token_denominator).sum() / targets.shape[0]
+    return token_loss.sum() / target_tokens.sum()
 
 
 def attention_residual_operators(model):
@@ -215,41 +234,6 @@ def routing_summary_metrics(source_maps, prefix):
     }
 
 
-def document_token_batch(iterator, tokenizer, batch_size, sequence_length):
-    """Return independent documents padded/truncated to a fixed sequence length.
-
-    We deliberately do not concatenate documents: a row in the batch is one
-    FineWeb document. Padding is carried in `attention_mask` and excluded from
-    corruption, loss, and processed-token accounting.
-    """
-    texts = [next(iterator)["text"] for _ in range(batch_size)]
-    return tokenizer(
-        texts,
-        truncation=True,
-        max_length=sequence_length,
-        padding="max_length",
-        return_tensors="pt",
-    )
-
-
-def heldout_token_batches(dataset, tokenizer, sequence_length, eval_cfg):
-    """Materialize deterministic documents reserved outside the training stream."""
-    iterator = iter(dataset)
-    batches = []
-    target_examples = int(eval_cfg.get("num_examples", 4))
-    while len(batches) < target_examples:
-        batch = tokenizer(
-            next(iterator)["text"],
-            truncation=True,
-            max_length=sequence_length,
-            padding="max_length",
-            return_tensors="pt",
-        )
-        if batch["attention_mask"].sum().item() >= 2:
-            batches.append(batch)
-    return batches
-
-
 def fixed_ratio_mask(valid_tokens, ratio, seed):
     """Choose an exact, deterministic masked subset of the valid token positions."""
     valid_positions = valid_tokens.nonzero(as_tuple=False)
@@ -293,7 +277,7 @@ def heldout_routing_metrics(
             for example_idx, batch in enumerate(heldout_batches):
                 ids = batch["input_ids"].to(device)
                 attention_mask = batch["attention_mask"].to(device)
-                valid_tokens_cpu = batch["attention_mask"].bool()
+                valid_tokens_cpu = batch["target_mask"].bool()
                 masked_cpu = fixed_ratio_mask(
                     valid_tokens_cpu,
                     ratio,
@@ -391,6 +375,14 @@ def main():
     diffusion_cfg = cfg.get("diffusion", {})
     masking_epsilon = diffusion_cfg.get("masking_epsilon", 1e-3)
     random_length_probability = diffusion_cfg.get("random_length_probability", 0.01)
+    objective = data_cfg.get("objective", "pretraining")
+    messages_field = data_cfg.get("messages_field", "messages")
+    if objective not in {"pretraining", "sft_response_only"}:
+        raise ValueError(f"unsupported data objective: {objective}")
+    if objective == "sft_response_only" and random_length_probability != 0.0:
+        raise ValueError(
+            "diffusion.random_length_probability must be 0 for response-only SFT"
+        )
     if not 0.0 < masking_epsilon < 1.0:
         raise ValueError("diffusion.masking_epsilon must be in (0, 1)")
     checkpoint = model_cfg["checkpoint"]
@@ -462,7 +454,13 @@ def main():
     else:
         optimizer = torch.optim.AdamW(parameter_groups, **optimizer_kwargs)
     tokens_per_step = world * opt_cfg["micro_batch_size"] * model_cfg["context_length"] * opt_cfg["gradient_accumulation_steps"]
-    total_steps = math.ceil(data_cfg["target_tokens"] / tokens_per_step)
+    configured_total_steps = opt_cfg.get("total_steps")
+    if configured_total_steps is not None:
+        total_steps = int(configured_total_steps)
+        if total_steps < 2:
+            raise ValueError("optimization.total_steps must be at least 2")
+    else:
+        total_steps = math.ceil(data_cfg["target_tokens"] / tokens_per_step)
     warmup_steps = opt_cfg.get("warmup_steps")
     if warmup_steps is None:
         warmup_steps = max(1, round(total_steps * opt_cfg["warmup_ratio"]))
@@ -500,7 +498,8 @@ def main():
         data_cfg["dataset"],
         name=data_cfg.get("subset"),
         split=data_cfg["split"],
-        streaming=True,
+        streaming=data_cfg.get("streaming", True),
+        cache_dir=data_cfg.get("cache_dir"),
     )
     routing_eval_cfg = cfg["logging"].get("heldout_routing_evaluation", {})
     routing_eval_enabled = bool(routing_eval_cfg.get("enabled", False))
@@ -526,19 +525,35 @@ def main():
             raise ValueError("held-out num_examples must be positive")
         if routing_reserved_documents < routing_num_examples:
             raise ValueError("held-out reserved_documents must be >= num_examples")
+    reserved_examples = routing_reserved_documents if routing_eval_enabled else 0
+    if data_cfg.get("streaming", True):
+        heldout_dataset = full_dataset.take(reserved_examples)
+        dataset = full_dataset.skip(reserved_examples)
+    else:
+        heldout_dataset = full_dataset.select(range(reserved_examples))
+        dataset = full_dataset.select(range(reserved_examples, len(full_dataset)))
     heldout_batches = (
         heldout_token_batches(
-            full_dataset.take(routing_reserved_documents),
+            heldout_dataset,
             tokenizer,
             model_cfg["context_length"],
             routing_eval_cfg,
+            objective=objective,
+            messages_field=messages_field,
         )
         if rank == 0 and routing_eval_enabled else []
     )
     # The same prefix is skipped on every rank, so none of the fixed routing
     # examples can later leak into optimization.
-    dataset = full_dataset.skip(routing_reserved_documents if routing_eval_enabled else 0).shard(world, rank)
-    iterator = iter(dataset)
+    shuffle_buffer_size = int(data_cfg.get("shuffle_buffer_size", 0))
+    if shuffle_buffer_size and data_cfg.get("streaming", True):
+        dataset = dataset.shuffle(seed=cfg["seed"], buffer_size=shuffle_buffer_size)
+    dataset = dataset.shard(world, rank)
+    iterator = repeat_dataset(
+        dataset,
+        shuffle=bool(shuffle_buffer_size),
+        seed=cfg["seed"] + rank,
+    )
     if world > 1:
         dist.barrier()
     if rank == 0:
@@ -548,7 +563,9 @@ def main():
         # Keep the exact input file in the run, not only its parsed key/value
         # representation shown in the W&B Config panel.
         run.save(str(args.config), base_path=str(args.config.parent), policy="now")
-    context, mask_id, processed = model_cfg["context_length"], model_cfg["mask_token_id"], 0
+    context, mask_id = model_cfg["context_length"], model_cfg["mask_token_id"]
+    processed = 0
+    processed_targets = 0
     attention_map_every = cfg["logging"].get("attention_maps_every_steps", 20)
     diagnostics_cfg = cfg["logging"].get("attention_residual_diagnostics", {})
     diagnostics_enabled = diagnostics_cfg.get("enabled", False)
@@ -559,19 +576,24 @@ def main():
         range(total_steps),
         disable=rank != 0,
         dynamic_ncols=True,
-        desc="FineWeb fine-tune",
+        desc="Response-only SFT" if objective == "sft_response_only" else "Pre-training",
     )
     for step in progress_bar:
         optimizer.zero_grad(set_to_none=True)
         loss_sum = 0.0
         mask_probability_sum = 0.0
         masked_fraction_sum = 0.0
+        valid_tokens_this_step = 0
+        target_tokens_this_step = 0
+        rejected_examples_this_step = 0
         for micro in range(opt_cfg["gradient_accumulation_steps"]):
-            batch = document_token_batch(
+            batch = token_batch(
                 iterator,
                 tokenizer,
                 opt_cfg["micro_batch_size"],
                 context,
+                objective=objective,
+                messages_field=messages_field,
             )
             ids = batch["input_ids"].to(device)
             attention_mask = batch["attention_mask"].to(device)
@@ -587,13 +609,14 @@ def main():
             batch_size, sequence_length = ids.shape
             p_mask = (1.0 - masking_epsilon) * torch.rand(batch_size, device=device) + masking_epsilon
             valid_tokens = attention_mask.bool()
-            masked = (torch.rand((batch_size, sequence_length), device=device) < p_mask[:, None]) & valid_tokens
-            # With micro-batch one, a very small p_mask can occasionally
-            # produce no masked token. Make that edge case trainable instead
-            # of passing an empty tensor to cross_entropy.
+            target_tokens = batch["target_mask"][:, :sequence_length].to(device).bool()
+            masked = (torch.rand((batch_size, sequence_length), device=device) < p_mask[:, None]) & target_tokens
+            # A very small p_mask can occasionally produce no masked token in
+            # a sequence. Make that edge case trainable instead of passing an
+            # empty tensor to cross_entropy.
             for row in range(batch_size):
                 if not masked[row].any():
-                    valid_positions = valid_tokens[row].nonzero(as_tuple=True)[0]
+                    valid_positions = target_tokens[row].nonzero(as_tuple=True)[0]
                     masked[row, valid_positions[torch.randint(valid_positions.numel(), (), device=device)]] = True
             corrupted = ids.masked_fill(masked, mask_id)
             ar_scale = min(step / cfg["attention_residuals"]["warmup_steps"], 1.0)
@@ -632,17 +655,27 @@ def main():
                     ),
                     capture_layer_diagnostics=capture_layer_diagnostics,
                 ).logits
-                token_loss = F.cross_entropy(logits[masked], ids[masked], reduction="none")
-                token_loss = token_loss / p_mask[:, None].expand_as(ids)[masked]
-                # With document-level padding, normalize by real tokens only.
-                loss = token_loss.sum() / valid_tokens.sum()
+                loss = masked_diffusion_loss(
+                    logits=logits,
+                    targets=ids,
+                    masked=masked,
+                    p_mask=p_mask,
+                    target_tokens=target_tokens,
+                    objective=objective,
+                )
                 loss = loss / opt_cfg["gradient_accumulation_steps"]
             if loss.requires_grad:
                 loss.backward()
             loss_sum += loss.detach().item()
             mask_probability_sum += p_mask.mean().item()
-            masked_fraction_sum += (masked.sum() / valid_tokens.sum()).item()
-            processed += valid_tokens.sum().item() * world
+            masked_fraction_sum += (masked.sum() / target_tokens.sum()).item()
+            valid_token_count = valid_tokens.sum().item() * world
+            target_token_count = target_tokens.sum().item() * world
+            processed += valid_token_count
+            processed_targets += target_token_count
+            valid_tokens_this_step += valid_token_count
+            target_tokens_this_step += target_token_count
+            rejected_examples_this_step += int(batch.get("rejected_examples", 0)) * world
         training_attention_maps = (
             list(model.module.model.last_attention_residual_maps) if capture_attention_maps else []
         )
@@ -756,6 +789,11 @@ def main():
             metrics = {
                 "train/loss": loss_sum,
                 "train/tokens": processed,
+                "train/target_tokens": processed_targets,
+                "train/all_tokens_per_step": valid_tokens_this_step,
+                "train/answer_tokens_per_step": target_tokens_this_step,
+                "train/prompt_tokens_per_step": valid_tokens_this_step - target_tokens_this_step,
+                "train/rejected_examples_per_step": rejected_examples_this_step,
                 "train/mask_probability": mask_probability_sum / opt_cfg["gradient_accumulation_steps"],
                 "train/masked_fraction": masked_fraction_sum / opt_cfg["gradient_accumulation_steps"],
                 "train/lr_base": next((group["lr"] for group in optimizer.param_groups if group["name"] == "base"), 0.0),
