@@ -1,6 +1,6 @@
 {
   "run_name": "llada8b-fineweb-paper-full-attn-res-only",
-  "git_commit": "8e1c19bdf1ba66db259431e8a383c8a0d3dded8b",
+  "git_commit": "46b38bbe81bffcc5b50c163805327aafdff3232b",
   "seed": 42,
   "model": {
     "checkpoint": "/extra_disk_1/vasilievpavel/dlm-attn-res/huggingface/hub/models--GSAI-ML--LLaDA-8B-Base/snapshots/0f2787f2d87eac5eed8a087d5ecd24277e6255b2",
