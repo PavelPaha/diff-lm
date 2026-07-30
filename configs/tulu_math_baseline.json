@@ -1,0 +1,77 @@
+{
+  "run_name": "llada8b-tulu-personas-math-baseline-uniform",
+  "git_commit": "3ca1d09f3b61e15087f5081df3a0b80703d7538e",
+  "seed": 42,
+  "model": {
+    "checkpoint": "/extra_disk_1/vasilievpavel/dlm-attn-res/huggingface/hub/models--GSAI-ML--LLaDA-8B-Base/snapshots/0f2787f2d87eac5eed8a087d5ecd24277e6255b2",
+    "dtype": "bfloat16",
+    "context_length": 1024,
+    "mask_token_id": 126336
+  },
+  "data": {
+    "objective": "sft_response_only",
+    "dataset": "allenai/tulu-3-sft-personas-math-filtered",
+    "subset": null,
+    "split": "train",
+    "messages_field": "messages",
+    "streaming": false,
+    "shuffle_buffer_size": 10000,
+    "sequence_packing": false,
+    "cache_dir": "/extra_disk_1/vasilievpavel/dlm-attn-res/huggingface"
+  },
+  "diffusion": {
+    "masking_epsilon": 0.001,
+    "random_length_probability": 0.0
+  },
+  "optimization": {
+    "total_steps": 1200,
+    "train_base_model": true,
+    "activation_checkpointing": null,
+    "base_learning_rate": 2e-5,
+    "attention_residual_learning_rate": 2e-5,
+    "min_lr_ratio": 0.1,
+    "scheduler": "linear_warmup_constant_linear_decay",
+    "warmup_steps": 160,
+    "decay_fraction": 0.1,
+    "weight_decay": 0.0,
+    "adam_beta1": 0.9,
+    "adam_beta2": 0.95,
+    "adam_eps": 1e-8,
+    "zero_stage_1": false,
+    "max_grad_norm": 1.0,
+    "global_batch_size_sequences": 256,
+    "micro_batch_size": 2,
+    "gradient_accumulation_steps": 128
+  },
+  "attention_residuals": {
+    "enabled": false,
+    "warmup_steps": 1,
+    "scale_schedule": "linear_0_to_1"
+  },
+  "distributed": {
+    "cuda_visible_devices": "2",
+    "world_size": 1
+  },
+  "logging": {
+    "wandb_base_url": "https://wandb-radfan.ru",
+    "wandb_entity": "diff-lm",
+    "wandb_project": "llada-attention-residuals",
+    "log_every_steps": 1,
+    "attention_maps_every_steps": 20,
+    "attention_residual_diagnostics": {
+      "enabled": true,
+      "every_steps": 20
+    },
+    "heldout_routing_evaluation": {
+      "enabled": true,
+      "every_steps": 20,
+      "num_examples": 4,
+      "mask_ratios": [0.1, 0.5, 0.9],
+      "raw_weight_scale_max": 1.0,
+      "seed": 10042,
+      "reserved_documents": 32
+    },
+    "checkpoint_every_steps": 500,
+    "output_dir": "/extra_disk_1/vasilievpavel/dlm-attn-res/runs"
+  }
+}
