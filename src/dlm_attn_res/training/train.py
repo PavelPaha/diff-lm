@@ -79,6 +79,139 @@ def transformer_layer_gradient_metrics(model):
     }
 
 
+QKV_PROJECTION_NAMES = ("q", "k", "v")
+
+
+def qkv_projection_modules(model):
+    """Yield the pretrained Q/K/V projections for every Transformer layer."""
+    for layer_idx, block in enumerate(model.model.transformer.blocks):
+        yield layer_idx, {
+            "q": block.q_proj,
+            "k": block.k_proj,
+            "v": block.v_proj,
+        }
+
+
+def qkv_norm_matrix(model, value):
+    """Return an absolute [Q/K/V, layer] matrix of weight or gradient norms."""
+    if value not in {"weight", "gradient"}:
+        raise ValueError(f"unsupported QKV norm value: {value}")
+    columns = []
+    for _, projections in qkv_projection_modules(model):
+        layer_values = []
+        for projection_name in QKV_PROJECTION_NAMES:
+            parameter = projections[projection_name].weight
+            tensor = parameter if value == "weight" else parameter.grad
+            layer_values.append(
+                parameter.new_tensor(0.0, dtype=torch.float32)
+                if tensor is None
+                else tensor.detach().float().norm()
+            )
+        columns.append(torch.stack(layer_values))
+    return torch.stack(columns, dim=1).cpu()
+
+
+def qkv_scalar_metrics(weight_norms, gradient_norms_pre_clip, gradient_norms_post_clip):
+    """Expose every absolute Q/K/V norm as a W&B scalar."""
+    metrics = {}
+    for projection_idx, projection_name in enumerate(QKV_PROJECTION_NAMES):
+        for layer_idx in range(weight_norms.shape[1]):
+            prefix = f"transformer/layer_{layer_idx:02d}/{projection_name}_proj"
+            metrics[f"{prefix}/weight_norm"] = weight_norms[projection_idx, layer_idx].item()
+            metrics[f"{prefix}/weight_grad_norm_pre_clip"] = (
+                gradient_norms_pre_clip[projection_idx, layer_idx].item()
+            )
+            metrics[f"{prefix}/weight_grad_norm_post_clip"] = (
+                gradient_norms_post_clip[projection_idx, layer_idx].item()
+            )
+    return metrics
+
+
+def absolute_matrix_heatmap(
+    values,
+    row_labels,
+    column_labels,
+    scale_max,
+    caption,
+):
+    """Render absolute values with a fixed, labelled cross-step color scale.
+
+    There is deliberately no centering, division by a per-image maximum, or
+    relative-to-baseline transform. Values above ``scale_max`` saturate red.
+    """
+    values = np.asarray(values, dtype=np.float32)
+    if values.ndim != 2:
+        raise ValueError("absolute heatmap values must be a matrix")
+    if values.shape != (len(row_labels), len(column_labels)):
+        raise ValueError("absolute heatmap labels do not match matrix shape")
+    if scale_max <= 0.0:
+        raise ValueError("absolute heatmap scale_max must be positive")
+
+    normalized_for_color_only = np.clip(values / scale_max, 0.0, 1.0)
+    rgb = raw_weight_colors(normalized_for_color_only)
+    cell_width, cell_height = 22, 44
+    heatmap_width = values.shape[1] * cell_width
+    heatmap_height = values.shape[0] * cell_height
+    left_margin, top_margin, bottom_margin = 58, 38, 55
+    colorbar_gap, colorbar_width, label_width = 22, 24, 76
+    canvas = Image.new(
+        "RGB",
+        (
+            left_margin
+            + heatmap_width
+            + colorbar_gap
+            + colorbar_width
+            + label_width,
+            top_margin + heatmap_height + bottom_margin,
+        ),
+        "white",
+    )
+    heatmap = Image.fromarray(rgb).resize(
+        (heatmap_width, heatmap_height),
+        resample=Image.Resampling.NEAREST,
+    )
+    canvas.paste(heatmap, (left_margin, top_margin))
+    draw = ImageDraw.Draw(canvas)
+    font = ImageFont.load_default(size=14)
+
+    for row_idx, row_label in enumerate(row_labels):
+        y = top_margin + row_idx * cell_height + cell_height // 2 - 7
+        draw.text((8, y), str(row_label), fill="black", font=font)
+    for column_idx, column_label in enumerate(column_labels):
+        if column_idx % 2 != 0:
+            continue
+        x = left_margin + column_idx * cell_width + 2
+        draw.text((x, top_margin + heatmap_height + 8), str(column_label), fill="black", font=font)
+
+    gradient_values = np.linspace(1.0, 0.0, heatmap_height, dtype=np.float32)
+    gradient_row = raw_weight_colors(gradient_values)[:, None, :]
+    gradient = np.repeat(gradient_row, colorbar_width, axis=1)
+    colorbar_x = left_margin + heatmap_width + colorbar_gap
+    canvas.paste(Image.fromarray(gradient), (colorbar_x, top_margin))
+    draw.text((left_margin, 5), caption, fill="black", font=font)
+    draw.text((colorbar_x - 2, 5), "absolute norm", fill="black", font=font)
+    for fraction in (1.0, 0.75, 0.5, 0.25, 0.0):
+        y = top_margin + round((1.0 - fraction) * (heatmap_height - 1))
+        draw.line(
+            (colorbar_x + colorbar_width, y, colorbar_x + colorbar_width + 5, y),
+            fill="black",
+            width=1,
+        )
+        draw.text(
+            (colorbar_x + colorbar_width + 8, y - 7),
+            f"{fraction * scale_max:.3g}",
+            fill="black",
+            font=font,
+        )
+    return wandb.Image(
+        canvas,
+        caption=(
+            f"{caption}; raw absolute L2/Frobenius norms; fixed scale "
+            f"[0, {scale_max:g}]; values above the maximum saturate"
+        ),
+    )
+
+
 def attention_residual_raw_image(source_maps, num_routes, scale_max=1.0, caption_prefix=""):
     """Render raw post-softmax routing weights with a fixed cross-step scale.
 
@@ -572,6 +705,16 @@ def main():
     diagnostics_every = int(diagnostics_cfg.get("every_steps", 20))
     if diagnostics_enabled and diagnostics_every < 1:
         raise ValueError("logging.attention_residual_diagnostics.every_steps must be positive")
+    qkv_diagnostics_cfg = cfg["logging"].get("qkv_diagnostics", {})
+    qkv_diagnostics_enabled = bool(qkv_diagnostics_cfg.get("enabled", False))
+    qkv_diagnostics_every = int(qkv_diagnostics_cfg.get("every_steps", 20))
+    qkv_weight_scale_max = float(qkv_diagnostics_cfg.get("weight_norm_scale_max", 100.0))
+    qkv_gradient_scale_max = float(qkv_diagnostics_cfg.get("gradient_norm_scale_max", 1.0))
+    if qkv_diagnostics_enabled:
+        if qkv_diagnostics_every < 1:
+            raise ValueError("logging.qkv_diagnostics.every_steps must be positive")
+        if qkv_weight_scale_max <= 0.0 or qkv_gradient_scale_max <= 0.0:
+            raise ValueError("QKV diagnostic heatmap scale maxima must be positive")
     progress_bar = tqdm(
         range(total_steps),
         disable=rank != 0,
@@ -704,6 +847,15 @@ def main():
         training_layer_diagnostics = (
             list(model.module.model.last_layer_diagnostics) if capture_layer_diagnostics else []
         )
+        capture_qkv_diagnostics = (
+            rank == 0
+            and qkv_diagnostics_enabled
+            and step % qkv_diagnostics_every == 0
+        )
+        qkv_gradient_norms_pre_clip = (
+            qkv_norm_matrix(model.module, "gradient")
+            if capture_qkv_diagnostics else None
+        )
         attn_grad_pre_clip, base_grad_pre_clip = norm(attn_params), norm(base_params)
         layer_gradients_pre_clip = (
             attention_residual_layer_metrics(model.module, include_gradients=True)
@@ -727,6 +879,14 @@ def main():
             # In AR-only training, scale=0 initially leaves all trainable AR
             # parameters outside the graph, so there is no optimizer step.
             scheduler.step()
+        qkv_gradient_norms_post_clip = (
+            qkv_norm_matrix(model.module, "gradient")
+            if capture_qkv_diagnostics else None
+        )
+        qkv_weight_norms = (
+            qkv_norm_matrix(model.module, "weight")
+            if capture_qkv_diagnostics else None
+        )
         heldout_metrics = {}
         heldout_routing_payload = {}
         if (
@@ -852,6 +1012,39 @@ def main():
                 metrics.update({f"{name}_pre_clip": value for name, value in transformer_gradients_pre_clip.items()})
                 transformer_gradients_post_clip = transformer_layer_gradient_metrics(model.module)
                 metrics.update({f"{name}_post_clip": value for name, value in transformer_gradients_post_clip.items()})
+            if capture_qkv_diagnostics:
+                assert qkv_weight_norms is not None
+                assert qkv_gradient_norms_pre_clip is not None
+                assert qkv_gradient_norms_post_clip is not None
+                metrics.update(
+                    qkv_scalar_metrics(
+                        qkv_weight_norms,
+                        qkv_gradient_norms_pre_clip,
+                        qkv_gradient_norms_post_clip,
+                    )
+                )
+                layer_labels = [f"L{layer_idx:02d}" for layer_idx in range(qkv_weight_norms.shape[1])]
+                metrics["projection_maps/qkv/weight_norms"] = absolute_matrix_heatmap(
+                    qkv_weight_norms.numpy(),
+                    row_labels=("Q", "K", "V"),
+                    column_labels=layer_labels,
+                    scale_max=qkv_weight_scale_max,
+                    caption="Q/K/V projection weight norms by Transformer layer",
+                )
+                metrics["projection_maps/qkv/gradient_norms_pre_clip"] = absolute_matrix_heatmap(
+                    qkv_gradient_norms_pre_clip.numpy(),
+                    row_labels=("Q", "K", "V"),
+                    column_labels=layer_labels,
+                    scale_max=qkv_gradient_scale_max,
+                    caption="Q/K/V projection gradient norms before global clipping",
+                )
+                metrics["projection_maps/qkv/gradient_norms_post_clip"] = absolute_matrix_heatmap(
+                    qkv_gradient_norms_post_clip.numpy(),
+                    row_labels=("Q", "K", "V"),
+                    column_labels=layer_labels,
+                    scale_max=qkv_gradient_scale_max,
+                    caption="Q/K/V projection gradient norms after global clipping",
+                )
             metrics.update(heldout_metrics)
             run.log(metrics, step=step)
             progress_bar.set_postfix(loss=f"{loss_sum:.4f}", lr=f"{metrics['train/lr_base']:.2e}/{metrics['train/lr_attention_residuals']:.2e}", ar=f"{ar_scale:.3f}")
