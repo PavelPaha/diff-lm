@@ -1,6 +1,6 @@
 {
-  "run_name": "llada8b-tulu-personas-math-full-attn-res-and-base-uniform",
-  "git_commit": "3ca1d09f3b61e15087f5081df3a0b80703d7538e",
+  "run_name": "llada8b-tulu-full-attn-res-and-base",
+  "git_commit": "2e8f05677fae5ed3bc32cbcc636c9379041bc047",
   "seed": 42,
   "model": {
     "checkpoint": "/extra_disk_1/vasilievpavel/dlm-attn-res/huggingface/hub/models--GSAI-ML--LLaDA-8B-Base/snapshots/0f2787f2d87eac5eed8a087d5ecd24277e6255b2",
@@ -66,6 +66,12 @@
     "attention_residual_diagnostics": {
       "enabled": true,
       "every_steps": 20
+    },
+    "qkv_diagnostics": {
+      "enabled": true,
+      "every_steps": 20,
+      "weight_norm_scale_max": 100.0,
+      "gradient_norm_scale_max": 1.0
     },
     "heldout_routing_evaluation": {
       "enabled": true,
