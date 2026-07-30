@@ -60,51 +60,11 @@ def transformer_layer_gradient_metrics(model):
     }
 
 
-def attention_residual_image(source_maps, num_routes):
-    """Render depth-wise AR routing as an explicit RGB heatmap.
-
-    Row `i` is routing before an Attention/MLP sub-layer (plus output); column
-    `j` is a raw source output from depth `j`. Colors show the weight
-    *relative to uniform routing* in that row: grey = uniform, red = preferred
-    source, blue = suppressed source. This makes small weights visible and
-    avoids W&B/Pillow treating NaNs outside the triangle as black pixels.
-    """
-    routing = np.zeros((num_routes, num_routes), dtype=np.float32)
-    valid = np.zeros((num_routes, num_routes), dtype=bool)
-    for route_idx, weights in enumerate(source_maps):
-        count = weights.numel()
-        # `weights * count - 1` is zero for an exactly uniform distribution.
-        routing[route_idx, :count] = weights.numpy() * count - 1.0
-        valid[route_idx, :count] = True
-
-    max_deviation = max(float(np.abs(routing[valid]).max(initial=0.0)), 1e-6)
-    normalized = np.clip(routing / max_deviation, -1.0, 1.0)
-    rgb = np.full((num_routes, num_routes, 3), 42, dtype=np.uint8)
-    # A compact diverging palette: blue -> neutral grey -> red.
-    positive = normalized >= 0
-    rgb[..., 0][valid] = 180
-    rgb[..., 1][valid] = 180
-    rgb[..., 2][valid] = 180
-    rgb[..., 0][valid & positive] = 180 + (75 * normalized[valid & positive]).astype(np.uint8)
-    rgb[..., 1][valid & positive] = 180 - (120 * normalized[valid & positive]).astype(np.uint8)
-    rgb[..., 2][valid & positive] = 180 - (120 * normalized[valid & positive]).astype(np.uint8)
-    negative = valid & ~positive
-    magnitude = -normalized[negative]
-    rgb[..., 0][negative] = 180 - (120 * magnitude).astype(np.uint8)
-    rgb[..., 1][negative] = 180 - (120 * magnitude).astype(np.uint8)
-    rgb[..., 2][negative] = 180 + (75 * magnitude).astype(np.uint8)
-    return wandb.Image(
-        rgb,
-        caption="Full AttnRes routing: row=target sub-layer/output, column=raw source depth; grey=uniform, red=preferred, blue=suppressed",
-    )
-
-
 def attention_residual_raw_image(source_maps, num_routes, scale_max=1.0, caption_prefix=""):
     """Render raw post-softmax routing weights with a fixed cross-step scale.
 
-    Blue is zero and red is ``scale_max``. Unlike
-    :func:`attention_residual_image`, values are not centered on the uniform
-    distribution and the image is never normalized using its own extrema.
+    Blue is zero and red is ``scale_max``. Values are not centered on the
+    uniform distribution or normalized using the image's extrema.
     """
     if scale_max <= 0.0:
         raise ValueError("raw routing heatmap scale_max must be positive")
@@ -214,6 +174,24 @@ def average_source_maps(map_sets, example_weights=None):
     ]
 
 
+def source_maps_to_json(source_maps):
+    """Convert triangular mean post-softmax maps to JSON-native values."""
+    return [weights.detach().float().cpu().tolist() for weights in source_maps]
+
+
+def write_routing_maps_json(directory, step, payload):
+    """Atomically write one parseable routing snapshot per optimizer step."""
+    directory.mkdir(parents=True, exist_ok=True)
+    destination = directory / f"step_{step:09d}.json"
+    temporary = destination.with_suffix(".json.tmp")
+    temporary.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2, allow_nan=False) + "\n",
+        encoding="utf-8",
+    )
+    os.replace(temporary, destination)
+    return destination
+
+
 def routing_summary_metrics(source_maps, prefix):
     """Compact numerical summaries complementing the per-layer heatmap."""
     if not source_maps:
@@ -303,6 +281,7 @@ def heldout_routing_metrics(
     was_training = module.training
     module.eval()
     metrics = {}
+    raw_payload = {}
     try:
         for ratio_idx, ratio in enumerate(mask_ratios):
             masked_map_sets = []
@@ -347,6 +326,19 @@ def heldout_routing_metrics(
                 "masked": average_source_maps(masked_map_sets, masked_token_counts),
                 "visible": average_source_maps(visible_map_sets, visible_token_counts),
             }
+            raw_payload[f"mask_{ratio_name}"] = {
+                "mask_ratio": ratio,
+                "num_examples": len(heldout_batches),
+                "token_counts": {
+                    "all": sum(all_token_counts),
+                    "masked": sum(masked_token_counts),
+                    "visible": sum(visible_token_counts),
+                },
+                "maps": {
+                    token_group: source_maps_to_json(maps)
+                    for token_group, maps in averaged_maps.items()
+                },
+            }
             metrics[f"routing_maps/heldout/mask_{ratio_name}/all/raw_weights"] = attention_residual_raw_image(
                 averaged_maps["all"],
                 num_routes,
@@ -374,7 +366,7 @@ def heldout_routing_metrics(
                 )
     finally:
         module.train(was_training)
-    return metrics
+    return metrics, raw_payload
 
 
 def main():
@@ -517,6 +509,12 @@ def main():
     routing_raw_scale_max = float(routing_eval_cfg.get("raw_weight_scale_max", 1.0))
     routing_num_examples = int(routing_eval_cfg.get("num_examples", 4))
     routing_reserved_documents = int(routing_eval_cfg.get("reserved_documents", 32))
+    routing_json_cfg = cfg["logging"].get("routing_maps_local_json", {})
+    routing_json_enabled = bool(routing_json_cfg.get("enabled", False))
+    routing_json_base = Path(
+        routing_json_cfg.get("base_directory", cfg["logging"]["output_dir"])
+    )
+    routing_json_directory = routing_json_base / cfg["run_name"] / "routing_maps"
     if routing_eval_enabled:
         if routing_eval_every < 1:
             raise ValueError("logging.heldout_routing_evaluation.every_steps must be positive")
@@ -544,6 +542,8 @@ def main():
     if world > 1:
         dist.barrier()
     if rank == 0:
+        if routing_json_enabled:
+            routing_json_directory.mkdir(parents=True, exist_ok=True)
         run = wandb.init(entity=cfg["logging"]["wandb_entity"], project=cfg["logging"]["wandb_project"], name=cfg["run_name"], config=cfg, settings=wandb.Settings(base_url=cfg["logging"]["wandb_base_url"]))
         # Keep the exact input file in the run, not only its parsed key/value
         # representation shown in the W&B Config panel.
@@ -658,7 +658,15 @@ def main():
         )
         training_route_names = (
             list(model.module.model.last_attention_residual_route_names)
-            if capture_attention_residual_diagnostics else []
+            if capture_attention_maps or capture_attention_residual_diagnostics else []
+        )
+        training_map_token_counts = (
+            {
+                "all": int(valid_tokens.sum().item()),
+                "masked": int(masked.sum().item()),
+                "visible": int((valid_tokens & ~masked).sum().item()),
+            }
+            if capture_attention_maps else {}
         )
         training_layer_diagnostics = (
             list(model.module.model.last_layer_diagnostics) if capture_layer_diagnostics else []
@@ -687,6 +695,7 @@ def main():
             # parameters outside the graph, so there is no optimizer step.
             scheduler.step()
         heldout_metrics = {}
+        heldout_routing_payload = {}
         if (
             rank == 0
             and routing_eval_enabled
@@ -694,7 +703,7 @@ def main():
             and ar_scale > 0.0
             and step % routing_eval_every == 0
         ):
-            heldout_metrics = heldout_routing_metrics(
+            heldout_metrics, heldout_routing_payload = heldout_routing_metrics(
                 model=model,
                 heldout_batches=heldout_batches,
                 mask_ratios=routing_eval_ratios,
@@ -703,6 +712,45 @@ def main():
                 attention_residual_scale=ar_scale,
                 raw_scale_max=routing_raw_scale_max,
                 seed=int(routing_eval_cfg.get("seed", cfg["seed"] + 10_000)),
+            )
+        if rank == 0 and routing_json_enabled and (
+            capture_attention_maps or heldout_routing_payload
+        ):
+            route_names = [
+                route_name
+                for route_name, _ in attention_residual_operators(model.module)
+            ]
+            json_payload = {
+                "schema_version": 1,
+                "run_name": cfg["run_name"],
+                "step": step,
+                "processed_tokens": processed,
+                "attention_residual_scale": ar_scale,
+                "value_semantics": (
+                    "mean post-softmax routing probability; softmax is over "
+                    "source_depth; no relative-to-uniform or per-map normalization"
+                ),
+                "softmax_axis": "source_depth",
+                "num_routes": len(route_names),
+                "route_names": route_names,
+                "source_counts": list(range(1, len(route_names) + 1)),
+                "train": {},
+                "heldout": heldout_routing_payload,
+            }
+            if capture_attention_maps:
+                json_payload["train"] = {
+                    "averaging": "last microbatch; mean over selected tokens",
+                    "token_counts": training_map_token_counts,
+                    "maps": {
+                        "all": source_maps_to_json(training_attention_maps),
+                        "masked": source_maps_to_json(training_masked_maps),
+                        "visible": source_maps_to_json(training_visible_maps),
+                    },
+                }
+            write_routing_maps_json(
+                routing_json_directory,
+                step,
+                json_payload,
             )
         if rank == 0 and step % cfg["logging"]["log_every_steps"] == 0:
             metrics = {
@@ -723,10 +771,6 @@ def main():
             }
             if capture_attention_maps:
                 num_routes = 2 * model.module.config.n_layers + 1
-                metrics["routing_maps/train/all/relative_to_uniform"] = attention_residual_image(
-                    training_attention_maps,
-                    num_routes,
-                )
                 metrics["routing_maps/train/all/raw_weights"] = attention_residual_raw_image(
                     training_attention_maps,
                     num_routes,

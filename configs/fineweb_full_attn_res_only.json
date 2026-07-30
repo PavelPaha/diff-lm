@@ -55,6 +55,10 @@
     "wandb_project": "llada-attention-residuals",
     "log_every_steps": 1,
     "attention_maps_every_steps": 20,
+    "routing_maps_local_json": {
+      "enabled": true,
+      "base_directory": "/extra_disk_1/vasilievpavel/dlm-attn-res/runs"
+    },
     "attention_residual_diagnostics": {
       "enabled": true,
       "every_steps": 20
