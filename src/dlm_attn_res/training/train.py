@@ -10,6 +10,7 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 from datasets import load_dataset
+from PIL import Image, ImageDraw, ImageFont
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed.optim import ZeroRedundancyOptimizer
 from transformers import AutoTokenizer
@@ -117,18 +118,78 @@ def attention_residual_raw_image(source_maps, num_routes, scale_max=1.0, caption
     normalized = np.clip(routing / scale_max, 0.0, 1.0)
     rgb = np.full((num_routes, num_routes, 3), 36, dtype=np.uint8)
     values = normalized[valid]
-    # Fixed blue -> cyan/yellow -> red palette.
-    rgb[..., 0][valid] = (255 * np.clip(2.0 * values - 0.5, 0.0, 1.0)).astype(np.uint8)
-    rgb[..., 1][valid] = (255 * np.clip(1.5 - np.abs(2.0 * values - 1.0), 0.0, 1.0)).astype(np.uint8)
-    rgb[..., 2][valid] = (255 * np.clip(1.0 - 2.0 * values, 0.0, 1.0)).astype(np.uint8)
+    rgb[valid] = raw_weight_colors(values)
+    rendered = raw_heatmap_with_colorbar(rgb, scale_max)
     prefix = f"{caption_prefix}; " if caption_prefix else ""
     return wandb.Image(
-        rgb,
+        rendered,
         caption=(
             f"{prefix}raw post-softmax routing weights; fixed scale [0, {scale_max:g}]; "
             "row=target sub-layer/output, column=raw source depth"
         ),
     )
+
+
+def raw_weight_colors(normalized):
+    """Map values in [0, 1] to a fixed blue→cyan→yellow→red palette."""
+    values = np.asarray(normalized, dtype=np.float32)
+    red = np.clip(3.0 * values - 1.0, 0.0, 1.0)
+    green = np.minimum(np.clip(3.0 * values, 0.0, 1.0), np.clip(3.0 * (1.0 - values), 0.0, 1.0))
+    blue = np.clip(2.0 - 3.0 * values, 0.0, 1.0)
+    return (255.0 * np.stack((red, green, blue), axis=-1)).astype(np.uint8)
+
+
+def raw_heatmap_with_colorbar(rgb, scale_max):
+    """Upscale a routing map and attach a labelled, numerically exact colorbar."""
+    cell_pixels = 6
+    heatmap_size = rgb.shape[0] * cell_pixels
+    left_margin, top_margin, bottom_margin = 42, 24, 42
+    colorbar_gap, colorbar_width, label_width = 18, 22, 64
+    canvas = Image.new(
+        "RGB",
+        (
+            left_margin + heatmap_size + colorbar_gap + colorbar_width + label_width,
+            top_margin + heatmap_size + bottom_margin,
+        ),
+        "white",
+    )
+    heatmap = Image.fromarray(rgb).resize(
+        (heatmap_size, heatmap_size),
+        resample=Image.Resampling.NEAREST,
+    )
+    canvas.paste(heatmap, (left_margin, top_margin))
+
+    gradient_values = np.linspace(1.0, 0.0, heatmap_size, dtype=np.float32)
+    gradient_row = raw_weight_colors(gradient_values)[:, None, :]
+    gradient = np.repeat(gradient_row, colorbar_width, axis=1)
+    colorbar_x = left_margin + heatmap_size + colorbar_gap
+    canvas.paste(Image.fromarray(gradient), (colorbar_x, top_margin))
+
+    draw = ImageDraw.Draw(canvas)
+    font = ImageFont.load_default(size=14)
+    draw.text((left_margin, 3), "target route (down)", fill="black", font=font)
+    draw.text(
+        (left_margin + heatmap_size // 2 - 46, top_margin + heatmap_size + 12),
+        "source depth (right)",
+        fill="black",
+        font=font,
+    )
+    draw.text((colorbar_x - 2, 3), "weight", fill="black", font=font)
+    for fraction in (1.0, 0.75, 0.5, 0.25, 0.0):
+        y = top_margin + round((1.0 - fraction) * (heatmap_size - 1))
+        draw.line(
+            (colorbar_x + colorbar_width, y, colorbar_x + colorbar_width + 5, y),
+            fill="black",
+            width=1,
+        )
+        label = f"{fraction * scale_max:.3g}"
+        draw.text(
+            (colorbar_x + colorbar_width + 8, y - 7),
+            label,
+            fill="black",
+            font=font,
+        )
+    return canvas
 
 
 def average_source_maps(map_sets, example_weights=None):
