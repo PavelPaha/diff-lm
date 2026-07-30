@@ -347,19 +347,19 @@ def heldout_routing_metrics(
                 "masked": average_source_maps(masked_map_sets, masked_token_counts),
                 "visible": average_source_maps(visible_map_sets, visible_token_counts),
             }
-            metrics[f"attn_res/heldout/mask_{ratio_name}/all/raw_weights"] = attention_residual_raw_image(
+            metrics[f"routing_maps/heldout/mask_{ratio_name}/all/raw_weights"] = attention_residual_raw_image(
                 averaged_maps["all"],
                 num_routes,
                 raw_scale_max,
                 caption_prefix=f"held-out mask ratio={ratio_name}, all valid tokens",
             )
-            metrics[f"attn_res/heldout/mask_{ratio_name}/masked/raw_weights"] = attention_residual_raw_image(
+            metrics[f"routing_maps/heldout/mask_{ratio_name}/masked/raw_weights"] = attention_residual_raw_image(
                 averaged_maps["masked"],
                 num_routes,
                 raw_scale_max,
                 caption_prefix=f"held-out mask ratio={ratio_name}, masked tokens",
             )
-            metrics[f"attn_res/heldout/mask_{ratio_name}/visible/raw_weights"] = attention_residual_raw_image(
+            metrics[f"routing_maps/heldout/mask_{ratio_name}/visible/raw_weights"] = attention_residual_raw_image(
                 averaged_maps["visible"],
                 num_routes,
                 raw_scale_max,
@@ -723,23 +723,23 @@ def main():
             }
             if capture_attention_maps:
                 num_routes = 2 * model.module.config.n_layers + 1
-                metrics["attn_res/source_attention"] = attention_residual_image(
+                metrics["routing_maps/train/all/relative_to_uniform"] = attention_residual_image(
                     training_attention_maps,
                     num_routes,
                 )
-                metrics["attn_res/train/all/raw_weights"] = attention_residual_raw_image(
+                metrics["routing_maps/train/all/raw_weights"] = attention_residual_raw_image(
                     training_attention_maps,
                     num_routes,
                     routing_raw_scale_max,
                     caption_prefix="training batch, all valid tokens",
                 )
-                metrics["attn_res/train/masked/raw_weights"] = attention_residual_raw_image(
+                metrics["routing_maps/train/masked/raw_weights"] = attention_residual_raw_image(
                     training_masked_maps,
                     num_routes,
                     routing_raw_scale_max,
                     caption_prefix="training batch, masked tokens",
                 )
-                metrics["attn_res/train/visible/raw_weights"] = attention_residual_raw_image(
+                metrics["routing_maps/train/visible/raw_weights"] = attention_residual_raw_image(
                     training_visible_maps,
                     num_routes,
                     routing_raw_scale_max,
